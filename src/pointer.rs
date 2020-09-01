@@ -21,6 +21,12 @@ impl<T> AtomicPtr<T> {
         }
     }
 
+    pub fn new(value: T) -> Self {
+        let b = Box::new(value);
+        let raw_ptr = Box::into_raw(b);
+        Self::from_usize(raw_ptr as usize)
+    }
+
     pub const fn null() -> Self {
         Self::from_usize(0)
     }

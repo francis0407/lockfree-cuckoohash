@@ -67,40 +67,25 @@ struct SlotIndex {
     slot_idx: usize,
 }
 
-/// `LockFreeCuckooHash` is a lock-free hash table using cuckoo hashing scheme.
-/// This implementation is based on the approach discussed in the paper:
-///
-/// "Nguyen, N., & Tsigas, P. (2014). Lock-Free Cuckoo Hashing. 2014 IEEE 34th International
-/// Conference on Distributed Computing Systems, 627-636."
-///
-/// Cuckoo hashing is an open addressing solution for hash collisions. The basic idea of cuckoo
-/// hashing is to resolve collisions by using two or more hash functions instead of only one. In this
-/// implementation, we use two hash functions and two arrays (or tables).
-///
-/// The search operation only looks up two slots, i.e. table[0][hash0(key)] and table[1][hash1(key)].
-/// If these two slots do not contain the key, the hash table does not contain the key. So the search operation
-/// only takes a constant time in the worst case.
-///
-/// The insert operation must pay the price for the quick search. The insert operation can only put the key
-/// into one of the two slots. However, when both slots are already occupied by other entries, it will be
-/// necessary to move other keys to their second locations (or back to their first locations) to make room
-/// for the new key, which is called a `relocation`. If the moved key can't be relocated because the other
-/// slot of it is also occupied, another `relocation` is required and so on. If relocation is a very long chain
-/// or meets a infinite loop, the table should be resized or rehashed.
-///
-#[derive(Default)]
-pub struct LockFreeCuckooHash<K, V> {
+struct MapInner<K, V> {
     // TODO: support customized hasher.
     hash_builders: [RandomState; 2],
+
     tables: Vec<Vec<AtomicPtr<KVPair<K, V>>>>,
     size: AtomicUsize,
+
+    // For resize
+    copy_batch_num: AtomicUsize,
+    copied_num: AtomicUsize,
+    new_map: AtomicPtr<MapInner<K, V>>,
 }
 
-impl<K, V> std::fmt::Debug for LockFreeCuckooHash<K, V>
+impl<K, V> std::fmt::Debug for MapInner<K, V>
 where
     K: std::fmt::Debug,
     V: std::fmt::Debug,
 {
+    // This is not thread-safe.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let capacity = self.tables[0].len();
         let guard = pin();
@@ -119,22 +104,12 @@ where
     }
 }
 
-impl<'guard, K, V> LockFreeCuckooHash<K, V>
+
+impl<'guard, K, V> MapInner<K, V>
 where
     K: 'guard + Eq + Hash,
 {
-    /// The default capacity of a new `LockFreeCuckooHash` when created by `LockFreeHashMap::new()`.
-    pub const DEFAULT_CAPACITY: usize = 16;
-
-    /// Create an empty `LockFreeCuckooHash` with default capacity.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::with_capacity(Self::DEFAULT_CAPACITY)
-    }
-
-    /// Creates an empty `LockFreeCuckooHash` with the specified capacity.
-    #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
+    fn with_capacity(capacity: usize, hash_builders: [RandomState; 2]) -> Self {
         let table_capacity = (capacity + 1) / 2;
         let mut tables = Vec::with_capacity(2);
 
@@ -147,123 +122,24 @@ where
         }
 
         Self {
-            hash_builders: [RandomState::new(), RandomState::new()],
+            hash_builders,
             tables,
             size: AtomicUsize::new(0),
+            copy_batch_num: AtomicUsize::new(0),
+            copied_num: AtomicUsize::new(0),
+            new_map: AtomicPtr::null(),
         }
     }
 
-    /// Returns the capacity of this hash table.
-    pub fn capacity(&self) -> usize {
+    fn capacity(&self) -> usize {
         self.tables[0].len() * 2
     }
 
-    // Returns the number of used slots of this hash table.
-    pub fn size(&self) -> usize {
+    fn size(&self) -> usize {
         self.size.load(Ordering::SeqCst)
     }
 
-    /// Returns a reference to the value corresponding to the key.
-    ///
-    /// # Example:
-    ///
-    /// ```
-    /// use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
-    /// let map = LockFreeCuckooHash::new();
-    /// map.insert(10, 10);
-    /// let guard = pin();
-    /// let v = map.search_with_guard(&10, &guard);
-    /// assert_eq!(*v.unwrap(), 10);
-    /// ```
-    ///
-    pub fn search_with_guard(&self, key: &K, guard: &'guard Guard) -> Option<&'guard V> {
-        self.search_inner(key, guard)
-    }
-
-    /// Insert a new key-value pair into the hashtable. If the key has already been in the
-    /// table, the value will be overridden.
-    ///
-    /// # Example:
-    ///
-    /// ```
-    /// use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
-    /// let map = LockFreeCuckooHash::new();
-    /// map.insert(10, 10);
-    /// let guard = pin();
-    /// let v1 = map.search_with_guard(&10, &guard);
-    /// assert_eq!(*v1.unwrap(), 10);
-    /// map.insert(10, 20);
-    /// let v2 = map.search_with_guard(&10, &guard);
-    /// assert_eq!(*v2.unwrap(), 20);
-    /// ```
-    ///
-    pub fn insert(&self, key: K, value: V) {
-        let guard = pin();
-        self.insert_with_guard(key, value, &guard)
-    }
-
-    /// Insert a new key-value pair into the hashtable. If the key has already been in the
-    /// table, the value will be overridden.
-    /// Different from `insert(k, v)`, this method requires a user provided guard.
-    ///
-    /// # Example:
-    ///
-    /// ```
-    /// use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
-    /// let map = LockFreeCuckooHash::new();
-    /// let guard = pin();
-    /// map.insert_with_guard(10, 10, &guard);
-    /// let v1 = map.search_with_guard(&10, &guard);
-    /// assert_eq!(*v1.unwrap(), 10);
-    /// map.insert_with_guard(10, 20, &guard);
-    /// let v2 = map.search_with_guard(&10, &guard);
-    /// assert_eq!(*v2.unwrap(), 20);
-    /// ```
-    ///
-    pub fn insert_with_guard(&self, key: K, value: V, guard: &'guard Guard) {
-        self.insert_inner(key, value, guard)
-    }
-
-    /// Remove a key from the map.
-    ///
-    /// # Example:
-    ///
-    /// ```
-    /// use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
-    /// let map = LockFreeCuckooHash::new();
-    /// let guard = pin();
-    /// map.insert(10, 20);
-    /// map.remove(&10);
-    /// let value = map.search_with_guard(&10, &guard);
-    /// assert_eq!(value.is_none(), true);
-    /// ```
-    ///
-    pub fn remove(&self, key: &K) -> bool {
-        let guard = pin();
-        self.remove_with_guard(key, &guard)
-    }
-
-    /// Remove a key from the map.
-    /// Different from `remove(k)`, this method requires a user provided guard.
-    ///
-    /// # Example:
-    ///
-    /// ```
-    /// use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
-    /// let map = LockFreeCuckooHash::new();
-    /// let guard = pin();
-    /// map.insert(10, 20);
-    /// map.remove_with_guard(&10, &guard);
-    /// let value = map.search_with_guard(&10, &guard);
-    /// assert_eq!(value.is_none(), true);
-    /// ```
-    ///
-    pub fn remove_with_guard(&self, key: &K, guard: &'guard Guard) -> bool {
-        self.remove_inner(key, guard)
-    }
-
-    /// Returns a reference to the value corresponding to the key.
-    fn search_inner(&self, key: &K, guard: &'guard Guard) -> Option<&'guard V> {
+    fn search(&self, key: &K, guard: &'guard Guard) -> Option<&'guard V> {
         // TODO: K could be a Borrowed.
         let slot_idx0 = self.get_index(0, key);
         // TODO: the second hash value could be lazily evaluated.
@@ -328,7 +204,7 @@ where
 
     /// Insert a new key-value pair into the hashtable. If the key has already been in the
     /// table, the value will be overridden.
-    fn insert_inner(&self, key: K, value: V, guard: &'guard Guard) {
+    fn insert(&self, key: K, value: V, outer_map: &AtomicPtr<Self>, guard: &'guard Guard) {
         let mut new_slot = SharedPtr::from_box(Box::new(KVPair { key, value }));
 
         let new_key = Self::get_entry_key(new_slot);
@@ -397,7 +273,7 @@ where
 
     /// Remove a key from the map.
     /// TODO: we can return the removed value.
-    fn remove_inner(&self, key: &K, guard: &'guard Guard) -> bool {
+    fn remove(&self, key: &K, outer_map: &AtomicPtr<Self>, guard: &'guard Guard) -> bool {
         let slot_idx0 = self.get_index(0, key);
         let slot_idx1 = self.get_index(1, key);
         let new_slot = SharedPtr::null();
@@ -449,6 +325,7 @@ where
         }
     }
 
+    
     /// `find` is similar to `search`, which searches the value corresponding to the key.
     /// The differences are:
     /// 1. `find` will help the relocation if the slot is marked.
@@ -547,6 +424,80 @@ where
             if !Self::check_counter(count0_0, count0_1, count1_0, count1_1) {
                 return (None, slot0, slot1);
             }
+        }
+    }
+
+    /// `help_relocate` helps relocate the slot at `src_idx` to the other corresponding slot.
+    fn help_relocate(&self, src_idx: SlotIndex, initiator: bool, guard: &'guard Guard) {
+        loop {
+            let mut src_slot = self.get_slot(src_idx, guard);
+            while initiator && !Self::is_marked(src_slot) {
+                if Self::slot_is_empty(src_slot) {
+                    return;
+                }
+                let new_slot_with_mark = src_slot.with_tag();
+                // The result will be checked by the `while condition`.
+                let _ = self.tables[src_idx.tbl_idx][src_idx.slot_idx].compare_and_set(
+                    src_slot,
+                    new_slot_with_mark,
+                    Ordering::SeqCst,
+                    guard,
+                );
+                src_slot = self.get_slot(src_idx, guard);
+            }
+            if !Self::is_marked(src_slot) {
+                return;
+            }
+
+            let (src_count, src_entry, _) = Self::unwrap_slot(src_slot);
+            let dst_idx = self.get_index(1 - src_idx.tbl_idx, &src_entry.unwrap().key);
+            let dst_slot = self.get_slot(dst_idx, guard);
+            let (dst_count, dst_entry, _) = Self::unwrap_slot(dst_slot);
+
+            if dst_entry.is_none() {
+                let new_count = if src_count > dst_count {
+                    src_count + 1
+                } else {
+                    dst_count + 1
+                };
+                if self.get_slot(src_idx, guard).as_raw() != src_slot.as_raw() {
+                    continue;
+                }
+                let new_slot = Self::set_rlcount(src_slot, new_count, guard);
+
+                if self.tables[dst_idx.tbl_idx][dst_idx.slot_idx]
+                    .compare_and_set(dst_slot, new_slot, Ordering::SeqCst, guard)
+                    .is_ok()
+                {
+                    let empty_slot = Self::set_rlcount(SharedPtr::null(), src_count + 1, guard);
+                    if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
+                        .compare_and_set(src_slot, empty_slot, Ordering::SeqCst, guard)
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+            }
+            // dst is not null
+            if src_slot.as_raw() == dst_slot.as_raw() {
+                let empty_slot = Self::set_rlcount(SharedPtr::null(), src_count + 1, guard);
+                if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
+                    .compare_and_set(src_slot, empty_slot, Ordering::SeqCst, guard)
+                    .is_ok()
+                {
+                    // failure cannot happen here.
+                }
+                return;
+            }
+            let new_slot_without_mark =
+                Self::set_rlcount(src_slot, src_count + 1, guard).without_tag();
+            if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
+                .compare_and_set(src_slot, new_slot_without_mark, Ordering::SeqCst, guard)
+                .is_ok()
+            {
+                // failure cannot happen here.
+            }
+            return;
         }
     }
 
@@ -679,80 +630,6 @@ where
         }
     }
 
-    /// `help_relocate` helps relocate the slot at `src_idx` to the other corresponding slot.
-    fn help_relocate(&self, src_idx: SlotIndex, initiator: bool, guard: &'guard Guard) {
-        loop {
-            let mut src_slot = self.get_slot(src_idx, guard);
-            while initiator && !Self::is_marked(src_slot) {
-                if Self::slot_is_empty(src_slot) {
-                    return;
-                }
-                let new_slot_with_mark = src_slot.with_tag();
-                // The result will be checked by the `while condition`.
-                let _ = self.tables[src_idx.tbl_idx][src_idx.slot_idx].compare_and_set(
-                    src_slot,
-                    new_slot_with_mark,
-                    Ordering::SeqCst,
-                    guard,
-                );
-                src_slot = self.get_slot(src_idx, guard);
-            }
-            if !Self::is_marked(src_slot) {
-                return;
-            }
-
-            let (src_count, src_entry, _) = Self::unwrap_slot(src_slot);
-            let dst_idx = self.get_index(1 - src_idx.tbl_idx, &src_entry.unwrap().key);
-            let dst_slot = self.get_slot(dst_idx, guard);
-            let (dst_count, dst_entry, _) = Self::unwrap_slot(dst_slot);
-
-            if dst_entry.is_none() {
-                let new_count = if src_count > dst_count {
-                    src_count + 1
-                } else {
-                    dst_count + 1
-                };
-                if self.get_slot(src_idx, guard).as_raw() != src_slot.as_raw() {
-                    continue;
-                }
-                let new_slot = Self::set_rlcount(src_slot, new_count, guard);
-
-                if self.tables[dst_idx.tbl_idx][dst_idx.slot_idx]
-                    .compare_and_set(dst_slot, new_slot, Ordering::SeqCst, guard)
-                    .is_ok()
-                {
-                    let empty_slot = Self::set_rlcount(SharedPtr::null(), src_count + 1, guard);
-                    if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
-                        .compare_and_set(src_slot, empty_slot, Ordering::SeqCst, guard)
-                        .is_ok()
-                    {
-                        return;
-                    }
-                }
-            }
-            // dst is not null
-            if src_slot.as_raw() == dst_slot.as_raw() {
-                let empty_slot = Self::set_rlcount(SharedPtr::null(), src_count + 1, guard);
-                if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
-                    .compare_and_set(src_slot, empty_slot, Ordering::SeqCst, guard)
-                    .is_ok()
-                {
-                    // failure cannot happen here.
-                }
-                return;
-            }
-            let new_slot_without_mark =
-                Self::set_rlcount(src_slot, src_count + 1, guard).without_tag();
-            if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
-                .compare_and_set(src_slot, new_slot_without_mark, Ordering::SeqCst, guard)
-                .is_ok()
-            {
-                // failure cannot happen here.
-            }
-            return;
-        }
-    }
-
     fn check_counter(c00: u8, c01: u8, c10: u8, c11: u8) -> bool {
         // TODO: handle overflow.
         c10 >= c00 + 2 && c11 >= c01 + 2 && c11 >= c00 + 3
@@ -829,6 +706,193 @@ where
                     Owned::from_raw(slot.as_raw() as *mut KVPair<K, V>).into_shared(guard),
                 );
             }
+        }
+    }
+}
+
+
+/// `LockFreeCuckooHash` is a lock-free hash table using cuckoo hashing scheme.
+/// This implementation is based on the approach discussed in the paper:
+///
+/// "Nguyen, N., & Tsigas, P. (2014). Lock-Free Cuckoo Hashing. 2014 IEEE 34th International
+/// Conference on Distributed Computing Systems, 627-636."
+///
+/// Cuckoo hashing is an open addressing solution for hash collisions. The basic idea of cuckoo
+/// hashing is to resolve collisions by using two or more hash functions instead of only one. In this
+/// implementation, we use two hash functions and two arrays (or tables).
+///
+/// The search operation only looks up two slots, i.e. table[0][hash0(key)] and table[1][hash1(key)].
+/// If these two slots do not contain the key, the hash table does not contain the key. So the search operation
+/// only takes a constant time in the worst case.
+///
+/// The insert operation must pay the price for the quick search. The insert operation can only put the key
+/// into one of the two slots. However, when both slots are already occupied by other entries, it will be
+/// necessary to move other keys to their second locations (or back to their first locations) to make room
+/// for the new key, which is called a `relocation`. If the moved key can't be relocated because the other
+/// slot of it is also occupied, another `relocation` is required and so on. If relocation is a very long chain
+/// or meets a infinite loop, the table should be resized or rehashed.
+///
+pub struct LockFreeCuckooHash<K, V> {
+    map: AtomicPtr<MapInner<K, V>>,
+}
+
+impl<K, V> std::fmt::Debug for LockFreeCuckooHash<K, V>
+where
+    K: std::fmt::Debug + Eq + Hash,
+    V: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = pin();
+        self.load_inner(&guard).fmt(f)
+    }
+}
+
+impl<K, V> Default for LockFreeCuckooHash<K, V>
+where
+    K: Eq + Hash,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'guard, K, V> LockFreeCuckooHash<K, V>
+where
+    K: 'guard + Eq + Hash,
+{
+    /// The default capacity of a new `LockFreeCuckooHash` when created by `LockFreeHashMap::new()`.
+    pub const DEFAULT_CAPACITY: usize = 16;
+
+    /// Create an empty `LockFreeCuckooHash` with default capacity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_capacity(Self::DEFAULT_CAPACITY)
+    }
+
+    /// Creates an empty `LockFreeCuckooHash` with the specified capacity.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            map: AtomicPtr::new(MapInner::with_capacity(capacity, [RandomState::new(), RandomState::new()])),
+        }
+    }
+
+    /// Returns the capacity of this hash table.
+    pub fn capacity(&self) -> usize {
+        let guard = pin();
+        self.load_inner(&guard).capacity()
+    }
+
+    // Returns the number of used slots of this hash table.
+    pub fn size(&self) -> usize {
+        let guard = pin();
+        self.load_inner(&guard).size()
+    }
+
+    /// Returns a reference to the value corresponding to the key.
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
+    /// let map = LockFreeCuckooHash::new();
+    /// map.insert(10, 10);
+    /// let guard = pin();
+    /// let v = map.search_with_guard(&10, &guard);
+    /// assert_eq!(*v.unwrap(), 10);
+    /// ```
+    ///
+    pub fn search_with_guard(&self, key: &K, guard: &'guard Guard) -> Option<&'guard V> {
+        self.load_inner(guard).search(key, guard)
+    }
+
+    /// Insert a new key-value pair into the hashtable. If the key has already been in the
+    /// table, the value will be overridden.
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
+    /// let map = LockFreeCuckooHash::new();
+    /// map.insert(10, 10);
+    /// let guard = pin();
+    /// let v1 = map.search_with_guard(&10, &guard);
+    /// assert_eq!(*v1.unwrap(), 10);
+    /// map.insert(10, 20);
+    /// let v2 = map.search_with_guard(&10, &guard);
+    /// assert_eq!(*v2.unwrap(), 20);
+    /// ```
+    ///
+    pub fn insert(&self, key: K, value: V) {
+        let guard = pin();
+        self.insert_with_guard(key, value, &guard)
+    }
+
+    /// Insert a new key-value pair into the hashtable. If the key has already been in the
+    /// table, the value will be overridden.
+    /// Different from `insert(k, v)`, this method requires a user provided guard.
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
+    /// let map = LockFreeCuckooHash::new();
+    /// let guard = pin();
+    /// map.insert_with_guard(10, 10, &guard);
+    /// let v1 = map.search_with_guard(&10, &guard);
+    /// assert_eq!(*v1.unwrap(), 10);
+    /// map.insert_with_guard(10, 20, &guard);
+    /// let v2 = map.search_with_guard(&10, &guard);
+    /// assert_eq!(*v2.unwrap(), 20);
+    /// ```
+    ///
+    pub fn insert_with_guard(&self, key: K, value: V, guard: &'guard Guard) {
+        self.load_inner(guard).insert(key, value, &self.map, guard);
+    }
+
+    /// Remove a key from the map.
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
+    /// let map = LockFreeCuckooHash::new();
+    /// let guard = pin();
+    /// map.insert(10, 20);
+    /// map.remove(&10);
+    /// let value = map.search_with_guard(&10, &guard);
+    /// assert_eq!(value.is_none(), true);
+    /// ```
+    ///
+    pub fn remove(&self, key: &K) -> bool {
+        let guard = pin();
+        self.remove_with_guard(key, &guard)
+    }
+
+    /// Remove a key from the map.
+    /// Different from `remove(k)`, this method requires a user provided guard.
+    ///
+    /// # Example:
+    ///
+    /// ```
+    /// use lockfree_cuckoohash::{pin, LockFreeCuckooHash};
+    /// let map = LockFreeCuckooHash::new();
+    /// let guard = pin();
+    /// map.insert(10, 20);
+    /// map.remove_with_guard(&10, &guard);
+    /// let value = map.search_with_guard(&10, &guard);
+    /// assert_eq!(value.is_none(), true);
+    /// ```
+    ///
+    pub fn remove_with_guard(&self, key: &K, guard: &'guard Guard) -> bool {
+        self.load_inner(guard).remove(key, &self.map, guard)
+    }
+
+    fn load_inner(&self, guard: &'guard Guard) -> &'guard MapInner<K, V> {
+        let raw = self.map.load(Ordering::SeqCst, guard).as_raw();
+        // map is always not null, so the unsafe code is safe here.
+        unsafe {
+            raw.as_ref().unwrap()
         }
     }
 }
