@@ -95,22 +95,24 @@ impl<T> SharedPtr<'_, T> {
         self.data
     }
 
-    const fn decompose_lower_bit(data: usize) -> (usize, bool) {
-        (data & !1, data & 1 == 1)
+    fn decompose_lower_u2(data: usize) -> (usize, u8) {
+        let mask: usize = 3;
+        // The unwrap is safe here, because we have mask the lower 2 bits.
+        (data & !mask, u8::try_from(data & mask).unwrap())
     }
 
     fn decompose_higher_u8(data: usize) -> (u8, usize) {
         let mask: usize = (1 << 56) - 1;
         let higher_u8 = u8::try_from(data >> 56);
-        // The unwarp is safe here, because we have shifted 56 bits.
+        // The unwrap is safe here, because we have shifted 56 bits.
         (higher_u8.unwrap(), data & mask)
     }
 
-    pub fn decompose(&self) -> (u8, *const T, bool) {
+    pub fn decompose(&self) -> (u8, *const T, u8) {
         let data = self.data;
-        let (data, lower_bit) = Self::decompose_lower_bit(data);
+        let (data, lower_u2) = Self::decompose_lower_u2(data);
         let (higher_u8, data) = Self::decompose_higher_u8(data);
-        (higher_u8, data as *const T, lower_bit)
+        (higher_u8, data as *const T, lower_u2)
     }
 
     pub fn as_raw(&self) -> *const T {
@@ -118,21 +120,14 @@ impl<T> SharedPtr<'_, T> {
         raw
     }
 
-    pub const fn with_tag(&self) -> Self {
-        Self::from_usize(self.data | 1)
-    }
-
-    pub const fn without_tag(&self) -> Self {
-        Self::from_usize(self.data & !1)
+    pub const fn with_lower_u2(&self, lower_u8: u8) -> Self {
+        let mask: usize = 3;
+        Self::from_usize(self.data & !mask | lower_u8 as usize)
     }
 
     pub const fn with_higher_u8(&self, higher_u8: u8) -> Self {
         let data = self.data;
         let mask: usize = (1 << 56) - 1;
         Self::from_usize((data & mask) | ((higher_u8 as usize) << 56))
-    }
-
-    pub const fn tag(&self) -> bool {
-        (self.data & 1) == 1
     }
 }

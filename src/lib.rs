@@ -67,6 +67,38 @@ struct SlotIndex {
     slot_idx: usize,
 }
 
+// SlotState represents the state of a slot.
+// A slot could be in one of the four states: null, key, reloc and copied.
+enum SlotState {
+    // NullOrKey means a slot is empty(null) or is ocupied by a key-value 
+    // pair normally without any other flags.
+    NullOrKey,
+    // Reloc means a slot is being relocated to the other slot.
+    Reloc,
+    // Copied means a slot is being copied to the new map during resize or
+    // has been copied to the new map.
+    Copied
+}
+
+impl SlotState {
+    fn as_u8(state: Self) -> u8 {
+        match state {
+            Self::NullOrKey => 0_u8,
+            Self::Reloc     => 1_u8,
+            Self::Copied    => 2_u8 
+        }
+    }
+
+    fn from_u8(state: u8) -> Self {
+        match state {
+            0 => Self::NullOrKey,
+            1 => Self::Reloc,
+            2 => Self::Copied,
+            _ => panic!("Invalid slot state from u8: {}", state)
+        }
+    }
+}
+
 struct MapInner<K, V> {
     // TODO: support customized hasher.
     hash_builders: [RandomState; 2],
@@ -353,7 +385,7 @@ where
             let slot0 = self.get_slot(slot_idx0, guard);
             let (count0_0, entry0, marked0_0) = Self::unwrap_slot(slot0);
             if let Some(pair) = entry0 {
-                if marked0_0 {
+                if let SlotState::Reloc = marked0_0 {
                     self.help_relocate(slot_idx0, false, guard);
                     continue;
                 }
@@ -367,7 +399,7 @@ where
             let slot1 = self.get_slot(slot_idx1, guard);
             let (count0_1, entry1, marked0_1) = Self::unwrap_slot(slot1);
             if let Some(pair) = entry1 {
-                if marked0_1 {
+                if let SlotState::Reloc = marked0_1 {
                     self.help_relocate(slot_idx1, false, guard);
                     continue;
                 }
@@ -390,7 +422,7 @@ where
             let slot0 = self.get_slot(slot_idx0, guard);
             let (count1_0, entry0, marked1_0) = Self::unwrap_slot(slot0);
             if let Some(pair) = entry0 {
-                if marked1_0 {
+                if let SlotState::Reloc = marked1_0 {
                     self.help_relocate(slot_idx0, false, guard);
                     continue;
                 }
@@ -402,7 +434,7 @@ where
             let slot1 = self.get_slot(slot_idx1, guard);
             let (count1_1, entry1, marked1_1) = Self::unwrap_slot(slot1);
             if let Some(pair) = entry1 {
-                if marked1_1 {
+                if let SlotState::Reloc = marked1_1 {
                     self.help_relocate(slot_idx1, false, guard);
                     continue;
                 }
@@ -431,21 +463,21 @@ where
     fn help_relocate(&self, src_idx: SlotIndex, initiator: bool, guard: &'guard Guard) {
         loop {
             let mut src_slot = self.get_slot(src_idx, guard);
-            while initiator && !Self::is_marked(src_slot) {
+            while initiator && !Self::slot_is_reloc(src_slot) {
                 if Self::slot_is_empty(src_slot) {
                     return;
                 }
-                let new_slot_with_mark = src_slot.with_tag();
+                let new_slot_with_reloc = src_slot.with_lower_u2(SlotState::as_u8(SlotState::Reloc));
                 // The result will be checked by the `while condition`.
                 let _ = self.tables[src_idx.tbl_idx][src_idx.slot_idx].compare_and_set(
                     src_slot,
-                    new_slot_with_mark,
+                    new_slot_with_reloc,
                     Ordering::SeqCst,
                     guard,
                 );
                 src_slot = self.get_slot(src_idx, guard);
             }
-            if !Self::is_marked(src_slot) {
+            if !Self::slot_is_reloc(src_slot) {
                 return;
             }
 
@@ -490,7 +522,8 @@ where
                 return;
             }
             let new_slot_without_mark =
-                Self::set_rlcount(src_slot, src_count + 1, guard).without_tag();
+                Self::set_rlcount(src_slot, src_count + 1, guard)
+                .with_lower_u2(SlotState::as_u8(SlotState::NullOrKey));
             if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
                 .compare_and_set(src_slot, new_slot_without_mark, Ordering::SeqCst, guard)
                 .is_ok()
@@ -521,7 +554,7 @@ where
         //    so we could swap the empty slot backward to the `origin_idx`. Once the
         //    slot at `origin_idx` is empty, the new key-value pair can be inserted.
         // 2. Swap slot
-        //    When we have discover a cuckoo path, we can swap the empty slot backward
+        //    When we have discovered a cuckoo path, we can swap the empty slot backward
         //    to the slot at `origin_idx`.
 
         'main_loop: loop {
@@ -529,7 +562,7 @@ where
             let mut depth = start_level;
             loop {
                 let mut slot = self.get_slot(slot_idx, guard);
-                while Self::is_marked(slot) {
+                while Self::slot_is_reloc(slot) {
                     self.help_relocate(slot_idx, false, guard);
                     slot = self.get_slot(slot_idx, guard);
                 }
@@ -573,7 +606,7 @@ where
                 'slot_swap: for i in (0..depth).rev() {
                     let src_idx = route[i];
                     let mut src_slot = self.get_slot(src_idx, guard);
-                    while Self::is_marked(src_slot) {
+                    while Self::slot_is_reloc(src_slot) {
                         self.help_relocate(src_idx, false, guard);
                         src_slot = self.get_slot(src_idx, guard);
                     }
@@ -639,8 +672,9 @@ where
         self.tables[0].len()
     }
 
-    fn is_marked(slot: SharedPtr<'guard, KVPair<K, V>>) -> bool {
-        slot.tag()
+    fn slot_is_reloc(slot: SharedPtr<'guard, KVPair<K, V>>) -> bool {
+        let (_, _, lower_u2) = slot.decompose();
+        SlotState::as_u8(SlotState::Reloc) == lower_u2
     }
 
     fn get_entry_key(slot: SharedPtr<'guard, KVPair<K, V>>) -> &K {
@@ -655,9 +689,10 @@ where
 
     fn unwrap_slot(
         slot: SharedPtr<'guard, KVPair<K, V>>,
-    ) -> (u8, Option<&'guard KVPair<K, V>>, bool) {
-        let (rlcount, raw, marked) = slot.decompose();
-        unsafe { (rlcount, raw.as_ref(), marked) }
+    ) -> (u8, Option<&'guard KVPair<K, V>>, SlotState) {
+        let (rlcount, raw, lower_u2) = slot.decompose();
+        let state = SlotState::from_u8(lower_u2);
+        unsafe { (rlcount, raw.as_ref(), state) }
     }
 
     fn set_rlcount(
@@ -677,7 +712,7 @@ where
         &self,
         slot_idx: SlotIndex,
         guard: &'guard Guard,
-    ) -> (u8, Option<&'guard KVPair<K, V>>, bool) {
+    ) -> (u8, Option<&'guard KVPair<K, V>>, SlotState) {
         // TODO: split this method by different memory ordering.
         Self::unwrap_slot(self.get_slot(slot_idx, guard))
     }
@@ -694,7 +729,7 @@ where
         let mut hasher = self.hash_builders[tbl_idx].build_hasher();
         key.hash(&mut hasher);
         let hash_value = usize::try_from(hasher.finish());
-        // The conversion from u64 to usize will never fail.
+        // The conversion from u64 to usize will never fail in a 64-bit env.
         let slot_idx = hash_value.unwrap() % self.tables[0].len();
         SlotIndex { tbl_idx, slot_idx }
     }
@@ -733,6 +768,7 @@ where
 /// or meets a infinite loop, the table should be resized or rehashed.
 ///
 pub struct LockFreeCuckooHash<K, V> {
+    // The inner map will be replaced after resize.
     map: AtomicPtr<MapInner<K, V>>,
 }
 
