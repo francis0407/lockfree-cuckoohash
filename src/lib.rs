@@ -89,7 +89,7 @@ enum SlotState {
 
 impl SlotState {
     /// `as_u8` converts a `SlotState` to `u8`.
-    fn as_u8(&self) -> u8 {
+    const fn as_u8(&self) -> u8 {
         match self {
             Self::NullOrKey => 0,
             Self::Reloc => 1,
@@ -255,7 +255,7 @@ where
         let mut new_slot = SharedPtr::from_box(Box::new(KVPair { key, value }));
         let (_, new_entry, _) = Self::unwrap_slot(new_slot);
         // new_entry is just created from `key`, so the unwrap() is safe here.
-        #[allow(clippy::option_unwrap_used)]
+        #[allow(clippy::unwrap_used)]
         let new_key = &new_entry.unwrap().key;
         let slot_idx0 = self.get_index(0, new_key);
         let slot_idx1 = self.get_index(1, new_key);
@@ -475,7 +475,7 @@ where
     }
 
     /// `help_relocate` helps relocate the slot at `src_idx` to the other corresponding slot.
-    #[allow(clippy::option_expect_used)]
+    #[allow(clippy::expect_used)]
     fn help_relocate(&self, src_idx: SlotIndex, initiator: bool, guard: &'guard Guard) {
         loop {
             let mut src_slot = self.get_slot(src_idx, guard);
@@ -764,7 +764,7 @@ where
     }
 
     /// `get_index` hashes the key and return the slot index.
-    #[allow(clippy::result_expect_used, clippy::integer_arithmetic)]
+    #[allow(clippy::expect_used, clippy::integer_arithmetic)]
     fn get_index(&self, tbl_idx: usize, key: &K) -> SlotIndex {
         let mut hasher = self.hash_builders[tbl_idx].build_hasher();
         key.hash(&mut hasher);
@@ -985,7 +985,7 @@ where
     }
 
     /// `load_inner` atomically loads the `MapInner` of hashmap.
-    #[allow(clippy::option_unwrap_used)]
+    #[allow(clippy::unwrap_used)]
     fn load_inner(&self, guard: &'guard Guard) -> &'guard MapInner<K, V> {
         let raw = self.map.load(Ordering::SeqCst, guard).as_raw();
         // map is always not null, so the unsafe code is safe here.
