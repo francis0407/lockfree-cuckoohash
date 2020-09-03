@@ -1,3 +1,4 @@
+//! This crate implements a lockfree cuckoo hashmap.
 #![deny(
     // The following are allowed by default lints according to
     // https://doc.rust-lang.org/rustc/lints/listing/allowed-by-default.html
@@ -24,16 +25,19 @@
     // warnings, TODO: treat all wanings as errors
 
     clippy::all,
-    // clippy::restriction,
+    clippy::restriction,
     clippy::pedantic,
     clippy::nursery,
-    // clippy::cargo
+    clippy::cargo
 )]
 #![allow(
     // Some explicitly allowed Clippy lints, must have clear reason to allow
     clippy::implicit_return, // actually omitting the return keyword is idiomatic Rust code
+    clippy::indexing_slicing,
+    clippy::integer_arithmetic,
 )]
 
+/// `pointer` defines atomic pointers which will be used for lockfree operations.
 mod pointer;
 
 use std::collections::hash_map::RandomState;
@@ -51,44 +55,49 @@ use crossbeam_epoch::Owned;
 // Re-export `crossbeam_epoch::pin()` and `crossbeam_epoch::Guard`.
 pub use crossbeam_epoch::{pin, Guard};
 
-// KVPair contains the key-value pair.
+/// `KVPair` contains the key-value pair.
 #[derive(Debug)]
+#[allow(clippy::missing_docs_in_private_items)]
 struct KVPair<K, V> {
     // TODO: maybe cache both hash keys here.
     key: K,
     value: V,
 }
 
-// SlotIndex represents the index of a slot inside the hashtable.
-// The slot index is composed by `tbl_idx` and `slot_idx`.
+/// `SlotIndex` represents the index of a slot inside the hashtable.
+/// The slot index is composed by `tbl_idx` and `slot_idx`.
 #[derive(Clone, Copy, Debug)]
 struct SlotIndex {
+    /// `tbl_idx` is the index of the table.
     tbl_idx: usize,
+    /// `slot_idx` is the index of the slot inside one table.
     slot_idx: usize,
 }
 
-// SlotState represents the state of a slot.
-// A slot could be in one of the four states: null, key, reloc and copied.
+/// `SlotState` represents the state of a slot.
+/// A slot could be in one of the four states: null, key, reloc and copied.
 enum SlotState {
-    // NullOrKey means a slot is empty(null) or is ocupied by a key-value 
-    // pair normally without any other flags.
+    /// `NullOrKey` means a slot is empty(null) or is ocupied by a key-value 
+    /// pair normally without any other flags.
     NullOrKey,
-    // Reloc means a slot is being relocated to the other slot.
+    /// `Reloc` means a slot is being relocated to the other slot.
     Reloc,
-    // Copied means a slot is being copied to the new map during resize or
-    // has been copied to the new map.
+    /// `Copied` means a slot is being copied to the new map during resize or
+    /// has been copied to the new map.
     Copied
 }
 
 impl SlotState {
-    fn as_u8(state: Self) -> u8 {
-        match state {
-            Self::NullOrKey => 0_u8,
-            Self::Reloc     => 1_u8,
-            Self::Copied    => 2_u8 
+    /// `as_u8` converts a `SlotState` to `u8`.
+    fn as_u8(&self) -> u8 {
+        match self {
+            Self::NullOrKey => 0,
+            Self::Reloc     => 1,
+            Self::Copied    => 2 
         }
     }
 
+    /// `from_u8` converts a `u8` to `SlotState`.
     fn from_u8(state: u8) -> Self {
         match state {
             0 => Self::NullOrKey,
@@ -99,17 +108,20 @@ impl SlotState {
     }
 }
 
+/// `MapInner` is the inner implementation of the `LockFreeCuckooHash`.
 struct MapInner<K, V> {
     // TODO: support customized hasher.
+    /// `hash_builders` is used to hash the keys.
     hash_builders: [RandomState; 2],
-
+    /// `tables` contains the key-value pairs.
     tables: Vec<Vec<AtomicPtr<KVPair<K, V>>>>,
+    /// `size` is the number of inserted pairs of the hash map.
     size: AtomicUsize,
 
-    // For resize
-    copy_batch_num: AtomicUsize,
-    copied_num: AtomicUsize,
-    new_map: AtomicPtr<MapInner<K, V>>,
+    // TODO: For resize
+    // copy_batch_num: AtomicUsize,
+    // copied_num: AtomicUsize,
+    // new_map: AtomicPtr<MapInner<K, V>>,
 }
 
 impl<K, V> std::fmt::Debug for MapInner<K, V>
@@ -141,6 +153,8 @@ impl<'guard, K, V> MapInner<K, V>
 where
     K: 'guard + Eq + Hash,
 {
+    /// `with_capacity` creates a new `MapInner` with specified capacity.
+    #[allow(clippy::integer_division)]
     fn with_capacity(capacity: usize, hash_builders: [RandomState; 2]) -> Self {
         let table_capacity = (capacity + 1) / 2;
         let mut tables = Vec::with_capacity(2);
@@ -157,20 +171,23 @@ where
             hash_builders,
             tables,
             size: AtomicUsize::new(0),
-            copy_batch_num: AtomicUsize::new(0),
-            copied_num: AtomicUsize::new(0),
-            new_map: AtomicPtr::null(),
+            // copy_batch_num: AtomicUsize::new(0),
+            // copied_num: AtomicUsize::new(0),
+            // new_map: AtomicPtr::null(),
         }
     }
 
+    /// `capacity` returns the current capacity of the hash map.
     fn capacity(&self) -> usize {
         self.tables[0].len() * 2
     }
 
+    /// `size` returns the number of inserted pairs of the hash map.
     fn size(&self) -> usize {
         self.size.load(Ordering::SeqCst)
     }
 
+    /// `search` searches the value corresponding to the key.
     fn search(&self, key: &K, guard: &'guard Guard) -> Option<&'guard V> {
         // TODO: K could be a Borrowed.
         let slot_idx0 = self.get_index(0, key);
@@ -236,10 +253,12 @@ where
 
     /// Insert a new key-value pair into the hashtable. If the key has already been in the
     /// table, the value will be overridden.
-    fn insert(&self, key: K, value: V, outer_map: &AtomicPtr<Self>, guard: &'guard Guard) {
+    fn insert(&self, key: K, value: V, _outer_map: &AtomicPtr<Self>, guard: &'guard Guard) {
         let mut new_slot = SharedPtr::from_box(Box::new(KVPair { key, value }));
-
-        let new_key = Self::get_entry_key(new_slot);
+        let (_, new_entry, _) = Self::unwrap_slot(new_slot);
+        // new_entry is just created from `key`, so the unwrap() is safe here.
+        #[allow(clippy::option_unwrap_used)]
+        let new_key = &new_entry.unwrap().key;
         let slot_idx0 = self.get_index(0, new_key);
         let slot_idx1 = self.get_index(1, new_key);
         loop {
@@ -305,17 +324,16 @@ where
 
     /// Remove a key from the map.
     /// TODO: we can return the removed value.
-    fn remove(&self, key: &K, outer_map: &AtomicPtr<Self>, guard: &'guard Guard) -> bool {
+    fn remove(&self, key: &K, _outer_map: &AtomicPtr<Self>, guard: &'guard Guard) -> bool {
         let slot_idx0 = self.get_index(0, key);
         let slot_idx1 = self.get_index(1, key);
         let new_slot = SharedPtr::null();
         loop {
             let (tbl_idx, slot0, slot1) = self.find(key, slot_idx0, slot_idx1, guard);
-            if tbl_idx.is_none() {
-                // The key does not exist.
-                return false;
-            }
-            let tbl_idx = tbl_idx.unwrap();
+            let tbl_idx = match tbl_idx {
+                Some(idx) => idx,
+                None => return false // The key does not exist.
+            };
             if tbl_idx == 0 {
                 Self::set_rlcount(new_slot, Self::get_rlcount(slot0), guard);
                 match self.tables[0][slot_idx0.slot_idx].compare_and_set(
@@ -460,6 +478,7 @@ where
     }
 
     /// `help_relocate` helps relocate the slot at `src_idx` to the other corresponding slot.
+    #[allow(clippy::option_expect_used)]
     fn help_relocate(&self, src_idx: SlotIndex, initiator: bool, guard: &'guard Guard) {
         loop {
             let mut src_slot = self.get_slot(src_idx, guard);
@@ -467,22 +486,25 @@ where
                 if Self::slot_is_empty(src_slot) {
                     return;
                 }
-                let new_slot_with_reloc = src_slot.with_lower_u2(SlotState::as_u8(SlotState::Reloc));
+                let new_slot_with_reloc = src_slot.with_lower_u2(SlotState::Reloc.as_u8());
                 // The result will be checked by the `while condition`.
-                let _ = self.tables[src_idx.tbl_idx][src_idx.slot_idx].compare_and_set(
+                match self.tables[src_idx.tbl_idx][src_idx.slot_idx].compare_and_set(
                     src_slot,
                     new_slot_with_reloc,
                     Ordering::SeqCst,
                     guard,
-                );
-                src_slot = self.get_slot(src_idx, guard);
+                ) {
+                    Ok(_) => break,
+                    // If the CAS failed, the initiator should try again. 
+                    Err(current_and_new) => src_slot = current_and_new.0
+                }
             }
             if !Self::slot_is_reloc(src_slot) {
                 return;
             }
 
             let (src_count, src_entry, _) = Self::unwrap_slot(src_slot);
-            let dst_idx = self.get_index(1 - src_idx.tbl_idx, &src_entry.unwrap().key);
+            let dst_idx = self.get_index(1 - src_idx.tbl_idx, &src_entry.expect("src slot is null").key);
             let dst_slot = self.get_slot(dst_idx, guard);
             let (dst_count, dst_entry, _) = Self::unwrap_slot(dst_slot);
 
@@ -523,7 +545,7 @@ where
             }
             let new_slot_without_mark =
                 Self::set_rlcount(src_slot, src_count + 1, guard)
-                .with_lower_u2(SlotState::as_u8(SlotState::NullOrKey));
+                .with_lower_u2(SlotState::NullOrKey.as_u8());
             if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
                 .compare_and_set(src_slot, new_slot_without_mark, Ordering::SeqCst, guard)
                 .is_ok()
@@ -534,14 +556,16 @@ where
         }
     }
 
+    /// `resize` resizes the table.
     #[allow(clippy::unused_self)]
     fn resize(&self) {
         // FIXME: implement this method.
         unimplemented!("resize() has not been implemented yet.")
     }
 
-    /// relocate tries to make the slot in `origin_idx` empty, in order to insert
+    /// `relocate` tries to make the slot in `origin_idx` empty, in order to insert
     /// a new key-value pair into it.
+    #[allow(clippy::integer_arithmetic)]
     fn relocate(&self, origin_idx: SlotIndex, guard: &'guard Guard) -> bool {
         let threshold = self.relocation_threshold();
         let mut route = Vec::with_capacity(10); // TODO: optimize this.
@@ -611,19 +635,19 @@ where
                         src_slot = self.get_slot(src_idx, guard);
                     }
                     let (_, entry, _) = Self::unwrap_slot(src_slot);
-                    if entry.is_none() {
-                        continue 'slot_swap;
-                    }
-                    let dst_idx = self.get_index(1 - src_idx.tbl_idx, &entry.unwrap().key);
-                    let (_, dst_entry, _) = self.get_entry(dst_idx, guard);
-                    // `dst_entry` should be empty. If it is not, it mains the cuckoo path
-                    // has been changed by other threads. Go back to complete the path.
-                    if dst_entry.is_some() {
-                        start_level = i + 1;
-                        slot_idx = dst_idx;
-                        continue 'main_loop;
-                    }
-                    self.help_relocate(src_idx, true, guard);
+                    if let Some(pair) = entry {
+                        let dst_idx = self.get_index(1 - src_idx.tbl_idx, &pair.key);
+                        let (_, dst_entry, _) = self.get_entry(dst_idx, guard);
+                        // `dst_entry` should be empty. If it is not, it mains the cuckoo path
+                        // has been changed by other threads. Go back to complete the path.
+                        if dst_entry.is_some() {
+                            start_level = i + 1;
+                            slot_idx = dst_idx;
+                            continue 'main_loop;
+                        }
+                        self.help_relocate(src_idx, true, guard);
+                    } 
+                    continue 'slot_swap;
                 }
             }
             return found;
@@ -646,7 +670,13 @@ where
         }
         let (_, entry0, _) = Self::unwrap_slot(slot0);
         let (slot1_count, entry1, _) = Self::unwrap_slot(slot1);
-        if entry0.is_none() || entry1.is_none() || !entry0.unwrap().key.eq(&entry1.unwrap().key) {
+        let mut need_dedup = false;
+        if let Some(pair0) = entry0 {
+            if let Some(pair1) = entry1 {
+                need_dedup = pair0.key.eq(&pair1.key);
+            }
+        }
+        if !need_dedup {
             return;
         }
         let need_free = slot0.as_raw() != slot1.as_raw();
@@ -663,30 +693,35 @@ where
         }
     }
 
+    /// `check_counter` checks the relocation count to decide 
+    /// whether we need to read the slots again.
+    #[allow(clippy::integer_arithmetic)]
     fn check_counter(c00: u8, c01: u8, c10: u8, c11: u8) -> bool {
         // TODO: handle overflow.
         c10 >= c00 + 2 && c11 >= c01 + 2 && c11 >= c00 + 3
     }
 
+    /// `relocation_threshold` returns the threshold of triggering resize.
     fn relocation_threshold(&self) -> usize {
         self.tables[0].len()
     }
 
+    /// `slot_is_reloc` checks if the slot is being relocated.
     fn slot_is_reloc(slot: SharedPtr<'guard, KVPair<K, V>>) -> bool {
         let (_, _, lower_u2) = slot.decompose();
-        SlotState::as_u8(SlotState::Reloc) == lower_u2
+        SlotState::Reloc.as_u8() == lower_u2
     }
 
-    fn get_entry_key(slot: SharedPtr<'guard, KVPair<K, V>>) -> &K {
-        let (_, entry, _) = Self::unwrap_slot(slot);
-        &entry.unwrap().key
-    }
-
+    /// `slot_is_empty` checks if the slot is a null pointer.
     fn slot_is_empty(slot: SharedPtr<'guard, KVPair<K, V>>) -> bool {
         let raw = slot.as_raw();
         raw.is_null()
     }
 
+    /// `unwrap_slot` unwraps the slot into three parts:
+    /// 1. the relocation count
+    /// 2. the key value pair
+    /// 3. the state of the slot
     fn unwrap_slot(
         slot: SharedPtr<'guard, KVPair<K, V>>,
     ) -> (u8, Option<&'guard KVPair<K, V>>, SlotState) {
@@ -695,6 +730,7 @@ where
         unsafe { (rlcount, raw.as_ref(), state) }
     }
 
+    /// `set_rlcount` sets the relocation count of a slot.
     fn set_rlcount(
         slot: SharedPtr<'guard, KVPair<K, V>>,
         rlcount: u8,
@@ -703,11 +739,13 @@ where
         slot.with_higher_u8(rlcount)
     }
 
+    /// `get_rlcount` returns the relocation count of a slot.
     fn get_rlcount(slot: SharedPtr<'guard, KVPair<K, V>>) -> u8 {
         let (rlcount, _, _) = slot.decompose();
         rlcount
     }
 
+    /// `get_entry` atomically loads the slot and unwrap it.
     fn get_entry(
         &self,
         slot_idx: SlotIndex,
@@ -717,6 +755,7 @@ where
         Self::unwrap_slot(self.get_slot(slot_idx, guard))
     }
 
+    /// `get_slot` atomically loads the slot.
     fn get_slot(
         &self,
         slot_idx: SlotIndex,
@@ -725,18 +764,27 @@ where
         self.tables[slot_idx.tbl_idx][slot_idx.slot_idx].load(Ordering::SeqCst, guard)
     }
 
+    /// `get_index` hashes the key and return the slot index.
+    #[allow(clippy::result_expect_used, clippy::integer_arithmetic)]
     fn get_index(&self, tbl_idx: usize, key: &K) -> SlotIndex {
         let mut hasher = self.hash_builders[tbl_idx].build_hasher();
         key.hash(&mut hasher);
         let hash_value = usize::try_from(hasher.finish());
         // The conversion from u64 to usize will never fail in a 64-bit env.
-        let slot_idx = hash_value.unwrap() % self.tables[0].len();
+        // self.tables[0].len() is always non-zero, so the arithmetic is safe here.
+        let slot_idx = hash_value.expect("Cannot convert u64 to usize") % self.tables[0].len();
         SlotIndex { tbl_idx, slot_idx }
     }
 
+    /// `defer_drop_ifneed` tries to defer to drop the slot if not empty.
+    #[allow(clippy::as_conversions)]
     fn defer_drop_ifneed(slot: SharedPtr<'guard, KVPair<K, V>>, guard: &'guard Guard) {
         if !Self::slot_is_empty(slot) {
             unsafe {
+                // We take over the ownership here.
+                // Because only one thread can call this method for the same 
+                // kv-pair, only one thread can take the ownership. So the 
+                // as_conversion is safe here.
                 guard.defer_destroy(
                     Owned::from_raw(slot.as_raw() as *mut KVPair<K, V>).into_shared(guard),
                 );
@@ -768,7 +816,7 @@ where
 /// or meets a infinite loop, the table should be resized or rehashed.
 ///
 pub struct LockFreeCuckooHash<K, V> {
-    // The inner map will be replaced after resize.
+    /// The inner map will be replaced after resize.
     map: AtomicPtr<MapInner<K, V>>,
 }
 
@@ -777,6 +825,7 @@ where
     K: std::fmt::Debug + Eq + Hash,
     V: std::fmt::Debug,
 {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let guard = pin();
         self.load_inner(&guard).fmt(f)
@@ -787,6 +836,7 @@ impl<K, V> Default for LockFreeCuckooHash<K, V>
 where
     K: Eq + Hash,
 {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -801,12 +851,14 @@ where
 
     /// Create an empty `LockFreeCuckooHash` with default capacity.
     #[must_use]
+    #[inline]
     pub fn new() -> Self {
         Self::with_capacity(Self::DEFAULT_CAPACITY)
     }
 
     /// Creates an empty `LockFreeCuckooHash` with the specified capacity.
     #[must_use]
+    #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             map: AtomicPtr::new(MapInner::with_capacity(capacity, [RandomState::new(), RandomState::new()])),
@@ -814,12 +866,14 @@ where
     }
 
     /// Returns the capacity of this hash table.
+    #[inline]
     pub fn capacity(&self) -> usize {
         let guard = pin();
         self.load_inner(&guard).capacity()
     }
 
-    // Returns the number of used slots of this hash table.
+    /// Returns the number of used slots of this hash table.
+    #[inline]
     pub fn size(&self) -> usize {
         let guard = pin();
         self.load_inner(&guard).size()
@@ -838,6 +892,7 @@ where
     /// assert_eq!(*v.unwrap(), 10);
     /// ```
     ///
+    #[inline]
     pub fn search_with_guard(&self, key: &K, guard: &'guard Guard) -> Option<&'guard V> {
         self.load_inner(guard).search(key, guard)
     }
@@ -859,6 +914,7 @@ where
     /// assert_eq!(*v2.unwrap(), 20);
     /// ```
     ///
+    #[inline]
     pub fn insert(&self, key: K, value: V) {
         let guard = pin();
         self.insert_with_guard(key, value, &guard)
@@ -882,6 +938,7 @@ where
     /// assert_eq!(*v2.unwrap(), 20);
     /// ```
     ///
+    #[inline]
     pub fn insert_with_guard(&self, key: K, value: V, guard: &'guard Guard) {
         self.load_inner(guard).insert(key, value, &self.map, guard);
     }
@@ -900,6 +957,7 @@ where
     /// assert_eq!(value.is_none(), true);
     /// ```
     ///
+    #[inline]
     pub fn remove(&self, key: &K) -> bool {
         let guard = pin();
         self.remove_with_guard(key, &guard)
@@ -920,10 +978,13 @@ where
     /// assert_eq!(value.is_none(), true);
     /// ```
     ///
+    #[inline]
     pub fn remove_with_guard(&self, key: &K, guard: &'guard Guard) -> bool {
         self.load_inner(guard).remove(key, &self.map, guard)
     }
 
+    /// `load_inner` atomically loads the `MapInner` of hashmap.
+    #[allow(clippy::option_unwrap_used)]
     fn load_inner(&self, guard: &'guard Guard) -> &'guard MapInner<K, V> {
         let raw = self.map.load(Ordering::SeqCst, guard).as_raw();
         // map is always not null, so the unsafe code is safe here.
@@ -934,6 +995,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::as_conver)]
 mod tests {
     use super::{pin, LockFreeCuckooHash};
     use rand::Rng;
@@ -1060,6 +1122,7 @@ mod tests {
 
     #[test]
     #[ignore]
+    #[allow(clippy::print_stdout)]
     fn bench_read_write() {
         let num_thread = 4;
         let capacity = 10_000_000;
@@ -1120,6 +1183,7 @@ mod tests {
 
     #[test]
     #[ignore]
+    #[allow(clippy::print_stdout)]
     fn bench_read_only() {
         let num_thread = 4;
         let capacity = 10_000_000;

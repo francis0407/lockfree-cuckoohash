@@ -1,12 +1,13 @@
 use crossbeam_epoch::Guard;
-use std::convert::TryFrom;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
 /// `AtomicPtr` is a pointer which can only be manipulated by
 /// atomic operations.
 #[derive(Debug)]
 pub struct AtomicPtr<T: ?Sized> {
+    /// `data` is the value of the atomic pointer.
     data: AtomicUsize,
+    /// used for type inference.
     _marker: PhantomData<*mut T>,
 }
 
@@ -14,6 +15,7 @@ unsafe impl<T: ?Sized + Send + Sync> Send for AtomicPtr<T> {}
 unsafe impl<T: ?Sized + Send + Sync> Sync for AtomicPtr<T> {}
 
 impl<T> AtomicPtr<T> {
+    /// `from_usize` creates an `AtomicPtr` from `usize`.
     const fn from_usize(data: usize) -> Self {
         Self {
             data: AtomicUsize::new(data),
@@ -21,31 +23,36 @@ impl<T> AtomicPtr<T> {
         }
     }
 
+    /// `new` creates the `value` on heap and returns its `AtomicPtr`.
+    #[allow(clippy::as_conversions)]
     pub fn new(value: T) -> Self {
         let b = Box::new(value);
         let raw_ptr = Box::into_raw(b);
         Self::from_usize(raw_ptr as usize)
     }
 
+    /// `null` returns a `AtomicPtr` with a null pointer.
     pub const fn null() -> Self {
         Self::from_usize(0)
     }
 
+    /// `load` atomically loads the pointer.
     pub fn load<'g>(&self, ord: Ordering, _: &'g Guard) -> SharedPtr<'g, T> {
         SharedPtr::from_usize(self.data.load(ord))
     }
 
+    /// `compare_and_set` wraps the `compare_exchange` method of `AtomicUsize`.
     pub fn compare_and_set<'g>(
         &self,
-        current: SharedPtr<'_, T>,
-        new: SharedPtr<'_, T>,
+        current_ptr: SharedPtr<'_, T>,
+        new_ptr: SharedPtr<'_, T>,
         ord: Ordering,
         _: &'g Guard,
     ) -> Result<SharedPtr<'g, T>, (SharedPtr<'g, T>, SharedPtr<'g, T>)> {
-        let new = new.as_usize();
+        let new = new_ptr.as_usize();
         // TODO: allow different ordering.
         self.data
-            .compare_exchange(current.as_usize(), new, ord, ord)
+            .compare_exchange(current_ptr.as_usize(), new, ord, ord)
             .map(|_| SharedPtr::from_usize(new))
             .map_err(|current| (SharedPtr::from_usize(current), SharedPtr::from_usize(new)))
     }
@@ -53,9 +60,14 @@ impl<T> AtomicPtr<T> {
 
 /// `SharedPtr` is a pointer which can be shared by multi-threads.
 /// `SharedPtr` can only be used with 64bit-wide pointer, and the
-/// pointer address must be 8-byte aligned.
+/// pointer address must be 4-byte aligned.
 pub struct SharedPtr<'g, T: 'g> {
+    /// `data` is the value of the pointers.
+    /// It will be spilt into three parts:
+    /// [higher_u8, raw_pointer, lower_u2]
+    ///    8 bits     54 bits     2 bits
     data: usize,
+    /// used for type inference.
     _marker: PhantomData<(&'g (), *const T)>,
 }
 
@@ -72,6 +84,7 @@ impl<T> Copy for SharedPtr<'_, T> {}
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
 impl<T> SharedPtr<'_, T> {
+    /// `from_usize` creates a `SharedPtr` from a `usize`.
     pub const fn from_usize(data: usize) -> Self {
         SharedPtr {
             data,
@@ -79,55 +92,79 @@ impl<T> SharedPtr<'_, T> {
         }
     }
 
+    /// `from_box` creates a `SharedPtr` from a `Box`.
     pub fn from_box(b: Box<T>) -> Self {
         Self::from_raw(Box::into_raw(b))
     }
 
+    /// `from_raw` creates a `SharedPtr` from a raw pointer.
+    #[allow(clippy::as_conversions)]
     pub fn from_raw(raw: *const T) -> Self {
         Self::from_usize(raw as usize)
     }
 
+    /// `null` returns a null `SharedPtr`.
     pub const fn null() -> Self {
         Self::from_usize(0)
     }
 
+    /// `as_usize` converts the pointer to `usize`.
     pub const fn as_usize(&self) -> usize {
         self.data
     }
 
-    fn decompose_lower_u2(data: usize) -> (usize, u8) {
+    /// `decompose_lower_u2` decomposes the pointer into two parts:
+    /// 1. the higher 62 bits
+    /// 2. the lower 2 bits
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+    const fn decompose_lower_u2(data: usize) -> (usize, u8) {
         let mask: usize = 3;
         // The unwrap is safe here, because we have mask the lower 2 bits.
-        (data & !mask, u8::try_from(data & mask).unwrap())
+        (data & !mask, (data & mask) as u8)
     }
 
-    fn decompose_higher_u8(data: usize) -> (u8, usize) {
+    /// `decompose_higher_u8` decomposes the pointer into two parts:
+    /// 1. the higher 8 bits
+    /// 2. the lower 56 bits
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+    const fn decompose_higher_u8(data: usize) -> (u8, usize) {
         let mask: usize = (1 << 56) - 1;
-        let higher_u8 = u8::try_from(data >> 56);
-        // The unwrap is safe here, because we have shifted 56 bits.
-        (higher_u8.unwrap(), data & mask)
+        // The conversion is safe here, because we have shifted 56 bits.
+        ((data >> 56) as u8, data & mask)
     }
 
-    pub fn decompose(&self) -> (u8, *const T, u8) {
+    /// `decompose` decomposes the pointer into three parts:
+    /// 1. the higher 8 bits
+    /// 2. the raw pointer
+    /// 3. the lower 2 bits
+    #[allow(clippy::as_conversions)]
+    pub const fn decompose(&self) -> (u8, *const T, u8) {
         let data = self.data;
-        let (data, lower_u2) = Self::decompose_lower_u2(data);
-        let (higher_u8, data) = Self::decompose_higher_u8(data);
-        (higher_u8, data as *const T, lower_u2)
+        let (higher_u62, lower_u2) = Self::decompose_lower_u2(data);
+        let (higher_u8, raw_ptr) = Self::decompose_higher_u8(higher_u62);
+        (higher_u8, raw_ptr as *const T, lower_u2)
     }
 
-    pub fn as_raw(&self) -> *const T {
+    /// `as_raw` extracts the raw pointer.
+    pub const fn as_raw(&self) -> *const T {
         let (_, raw, _) = self.decompose();
         raw
     }
 
+    /// `with_lower_u2` resets the lower 2 bits of the pointer.
+    #[allow(clippy::as_conversions)]
     pub const fn with_lower_u2(&self, lower_u8: u8) -> Self {
         let mask: usize = 3;
+        // Convert a u8 to usize is always safe.
         Self::from_usize(self.data & !mask | lower_u8 as usize)
     }
 
+    /// `with_higher_u8` resets the higher 8 bits of pointer.
+    #[allow(clippy::as_conversions)]
     pub const fn with_higher_u8(&self, higher_u8: u8) -> Self {
         let data = self.data;
         let mask: usize = (1 << 56) - 1;
+        // Convert a u8 to usize is always safe.
         Self::from_usize((data & mask) | ((higher_u8 as usize) << 56))
     }
 }
