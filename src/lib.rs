@@ -77,14 +77,14 @@ struct SlotIndex {
 /// `SlotState` represents the state of a slot.
 /// A slot could be in one of the four states: null, key, reloc and copied.
 enum SlotState {
-    /// `NullOrKey` means a slot is empty(null) or is ocupied by a key-value 
+    /// `NullOrKey` means a slot is empty(null) or is ocupied by a key-value
     /// pair normally without any other flags.
     NullOrKey,
     /// `Reloc` means a slot is being relocated to the other slot.
     Reloc,
     /// `Copied` means a slot is being copied to the new map during resize or
     /// has been copied to the new map.
-    Copied
+    Copied,
 }
 
 impl SlotState {
@@ -92,8 +92,8 @@ impl SlotState {
     fn as_u8(&self) -> u8 {
         match self {
             Self::NullOrKey => 0,
-            Self::Reloc     => 1,
-            Self::Copied    => 2 
+            Self::Reloc => 1,
+            Self::Copied => 2,
         }
     }
 
@@ -103,7 +103,7 @@ impl SlotState {
             0 => Self::NullOrKey,
             1 => Self::Reloc,
             2 => Self::Copied,
-            _ => panic!("Invalid slot state from u8: {}", state)
+            _ => panic!("Invalid slot state from u8: {}", state),
         }
     }
 }
@@ -117,7 +117,6 @@ struct MapInner<K, V> {
     tables: Vec<Vec<AtomicPtr<KVPair<K, V>>>>,
     /// `size` is the number of inserted pairs of the hash map.
     size: AtomicUsize,
-
     // TODO: For resize
     // copy_batch_num: AtomicUsize,
     // copied_num: AtomicUsize,
@@ -147,7 +146,6 @@ where
         f.finish()
     }
 }
-
 
 impl<'guard, K, V> MapInner<K, V>
 where
@@ -332,7 +330,7 @@ where
             let (tbl_idx, slot0, slot1) = self.find(key, slot_idx0, slot_idx1, guard);
             let tbl_idx = match tbl_idx {
                 Some(idx) => idx,
-                None => return false // The key does not exist.
+                None => return false, // The key does not exist.
             };
             if tbl_idx == 0 {
                 Self::set_rlcount(new_slot, Self::get_rlcount(slot0), guard);
@@ -375,7 +373,6 @@ where
         }
     }
 
-    
     /// `find` is similar to `search`, which searches the value corresponding to the key.
     /// The differences are:
     /// 1. `find` will help the relocation if the slot is marked.
@@ -495,8 +492,8 @@ where
                     guard,
                 ) {
                     Ok(_) => break,
-                    // If the CAS failed, the initiator should try again. 
-                    Err(current_and_new) => src_slot = current_and_new.0
+                    // If the CAS failed, the initiator should try again.
+                    Err(current_and_new) => src_slot = current_and_new.0,
                 }
             }
             if !Self::slot_is_reloc(src_slot) {
@@ -504,7 +501,10 @@ where
             }
 
             let (src_count, src_entry, _) = Self::unwrap_slot(src_slot);
-            let dst_idx = self.get_index(1 - src_idx.tbl_idx, &src_entry.expect("src slot is null").key);
+            let dst_idx = self.get_index(
+                1 - src_idx.tbl_idx,
+                &src_entry.expect("src slot is null").key,
+            );
             let dst_slot = self.get_slot(dst_idx, guard);
             let (dst_count, dst_entry, _) = Self::unwrap_slot(dst_slot);
 
@@ -543,8 +543,7 @@ where
                 }
                 return;
             }
-            let new_slot_without_mark =
-                Self::set_rlcount(src_slot, src_count + 1, guard)
+            let new_slot_without_mark = Self::set_rlcount(src_slot, src_count + 1, guard)
                 .with_lower_u2(SlotState::NullOrKey.as_u8());
             if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
                 .compare_and_set(src_slot, new_slot_without_mark, Ordering::SeqCst, guard)
@@ -646,7 +645,7 @@ where
                             continue 'main_loop;
                         }
                         self.help_relocate(src_idx, true, guard);
-                    } 
+                    }
                     continue 'slot_swap;
                 }
             }
@@ -693,7 +692,7 @@ where
         }
     }
 
-    /// `check_counter` checks the relocation count to decide 
+    /// `check_counter` checks the relocation count to decide
     /// whether we need to read the slots again.
     #[allow(clippy::integer_arithmetic)]
     fn check_counter(c00: u8, c01: u8, c10: u8, c11: u8) -> bool {
@@ -782,8 +781,8 @@ where
         if !Self::slot_is_empty(slot) {
             unsafe {
                 // We take over the ownership here.
-                // Because only one thread can call this method for the same 
-                // kv-pair, only one thread can take the ownership. So the 
+                // Because only one thread can call this method for the same
+                // kv-pair, only one thread can take the ownership. So the
                 // as_conversion is safe here.
                 guard.defer_destroy(
                     Owned::from_raw(slot.as_raw() as *mut KVPair<K, V>).into_shared(guard),
@@ -792,7 +791,6 @@ where
         }
     }
 }
-
 
 /// `LockFreeCuckooHash` is a lock-free hash table using cuckoo hashing scheme.
 /// This implementation is based on the approach discussed in the paper:
@@ -861,7 +859,10 @@ where
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            map: AtomicPtr::new(MapInner::with_capacity(capacity, [RandomState::new(), RandomState::new()])),
+            map: AtomicPtr::new(MapInner::with_capacity(
+                capacity,
+                [RandomState::new(), RandomState::new()],
+            )),
         }
     }
 
@@ -988,9 +989,7 @@ where
     fn load_inner(&self, guard: &'guard Guard) -> &'guard MapInner<K, V> {
         let raw = self.map.load(Ordering::SeqCst, guard).as_raw();
         // map is always not null, so the unsafe code is safe here.
-        unsafe {
-            raw.as_ref().unwrap()
-        }
+        unsafe { raw.as_ref().unwrap() }
     }
 }
 
