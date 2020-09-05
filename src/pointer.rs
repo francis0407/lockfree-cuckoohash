@@ -126,7 +126,7 @@ impl<T> SharedPtr<'_, T> {
     /// `decompose_higher_u8` decomposes the pointer into two parts:
     /// 1. the higher 8 bits
     /// 2. the lower 56 bits
-    #[allow(clippy::as_conversions, clippy::cast_possible_truncation)]
+    #[allow(clippy::as_conversions, clippy::cast_possible_truncation, clippy::integer_arithmetic)]
     const fn decompose_higher_u8(data: usize) -> (u8, usize) {
         let mask: usize = (1 << 56) - 1;
         // The conversion is safe here, because we have shifted 56 bits.
@@ -160,7 +160,7 @@ impl<T> SharedPtr<'_, T> {
     }
 
     /// `with_higher_u8` resets the higher 8 bits of pointer.
-    #[allow(clippy::as_conversions)]
+    #[allow(clippy::as_conversions, clippy::integer_arithmetic)]
     pub const fn with_higher_u8(&self, higher_u8: u8) -> Self {
         let data = self.data;
         let mask: usize = (1 << 56) - 1;

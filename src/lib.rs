@@ -34,7 +34,6 @@
     // Some explicitly allowed Clippy lints, must have clear reason to allow
     clippy::implicit_return, // actually omitting the return keyword is idiomatic Rust code
     clippy::indexing_slicing,
-    clippy::integer_arithmetic,
 )]
 
 /// `pointer` defines atomic pointers which will be used for lockfree operations.
@@ -154,12 +153,15 @@ where
     /// `with_capacity` creates a new `MapInner` with specified capacity.
     #[allow(clippy::integer_division)]
     fn with_capacity(capacity: usize, hash_builders: [RandomState; 2]) -> Self {
-        let table_capacity = (capacity + 1) / 2;
+        let single_table_capacity = match capacity.checked_add(1) {
+            Some(capacity) => capacity.overflowing_div(2).0,
+            None => capacity.overflowing_div(2).0
+        };
         let mut tables = Vec::with_capacity(2);
 
         for _ in 0..2 {
-            let mut table = Vec::with_capacity(table_capacity);
-            for _ in 0..table_capacity {
+            let mut table = Vec::with_capacity(single_table_capacity);
+            for _ in 0..single_table_capacity {
                 table.push(AtomicPtr::null());
             }
             tables.push(table);
@@ -177,7 +179,7 @@ where
 
     /// `capacity` returns the current capacity of the hash map.
     fn capacity(&self) -> usize {
-        self.tables[0].len() * 2
+        self.tables[0].len().overflowing_mul(2).0
     }
 
     /// `size` returns the number of inserted pairs of the hash map.
@@ -502,17 +504,18 @@ where
 
             let (src_count, src_entry, _) = Self::unwrap_slot(src_slot);
             let dst_idx = self.get_index(
-                1 - src_idx.tbl_idx,
+                1_usize.overflowing_sub(src_idx.tbl_idx).0,
                 &src_entry.expect("src slot is null").key,
             );
             let dst_slot = self.get_slot(dst_idx, guard);
             let (dst_count, dst_entry, _) = Self::unwrap_slot(dst_slot);
 
             if dst_entry.is_none() {
+                // overflow will be handled by `check_counter`.
                 let new_count = if src_count > dst_count {
-                    src_count + 1
+                    src_count.overflowing_add(1).0
                 } else {
-                    dst_count + 1
+                    dst_count.overflowing_add(1).0
                 };
                 if self.get_slot(src_idx, guard).as_raw() != src_slot.as_raw() {
                     continue;
@@ -523,7 +526,8 @@ where
                     .compare_and_set(dst_slot, new_slot, Ordering::SeqCst, guard)
                     .is_ok()
                 {
-                    let empty_slot = Self::set_rlcount(SharedPtr::null(), src_count + 1, guard);
+                    // overflow will be handled by `check_counter`.
+                    let empty_slot = Self::set_rlcount(SharedPtr::null(), src_count.overflowing_add(1).0, guard);
                     if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
                         .compare_and_set(src_slot, empty_slot, Ordering::SeqCst, guard)
                         .is_ok()
@@ -534,7 +538,8 @@ where
             }
             // dst is not null
             if src_slot.as_raw() == dst_slot.as_raw() {
-                let empty_slot = Self::set_rlcount(SharedPtr::null(), src_count + 1, guard);
+                // overflow will be handled by `check_counter`.
+                let empty_slot = Self::set_rlcount(SharedPtr::null(), src_count.overflowing_add(1).0, guard);
                 if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
                     .compare_and_set(src_slot, empty_slot, Ordering::SeqCst, guard)
                     .is_ok()
@@ -543,7 +548,8 @@ where
                 }
                 return;
             }
-            let new_slot_without_mark = Self::set_rlcount(src_slot, src_count + 1, guard)
+            // overflow will be handled by `check_counter`.
+            let new_slot_without_mark = Self::set_rlcount(src_slot, src_count.overflowing_add(1).0, guard)
                 .with_lower_u2(SlotState::NullOrKey.as_u8());
             if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
                 .compare_and_set(src_slot, new_slot_without_mark, Ordering::SeqCst, guard)
