@@ -35,7 +35,7 @@
     clippy::implicit_return, // actually omitting the return keyword is idiomatic Rust code
     // indexing will never panic here, because all of the index has been mod by the length
     // of the vector.
-    clippy::indexing_slicing, 
+    clippy::indexing_slicing,
 )]
 
 /// `pointer` defines atomic pointers which will be used for lockfree operations.
@@ -157,7 +157,7 @@ where
     fn with_capacity(capacity: usize, hash_builders: [RandomState; 2]) -> Self {
         let single_table_capacity = match capacity.checked_add(1) {
             Some(capacity) => capacity.overflowing_div(2).0,
-            None => capacity.overflowing_div(2).0
+            None => capacity.overflowing_div(2).0,
         };
         let mut tables = Vec::with_capacity(2);
 
@@ -529,7 +529,8 @@ where
                     .is_ok()
                 {
                     // overflow will be handled by `check_counter`.
-                    let empty_slot = Self::set_rlcount(SharedPtr::null(), src_count.overflowing_add(1).0, guard);
+                    let empty_slot =
+                        Self::set_rlcount(SharedPtr::null(), src_count.overflowing_add(1).0, guard);
                     if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
                         .compare_and_set(src_slot, empty_slot, Ordering::SeqCst, guard)
                         .is_ok()
@@ -541,7 +542,8 @@ where
             // dst is not null
             if src_slot.as_raw() == dst_slot.as_raw() {
                 // overflow will be handled by `check_counter`.
-                let empty_slot = Self::set_rlcount(SharedPtr::null(), src_count.overflowing_add(1).0, guard);
+                let empty_slot =
+                    Self::set_rlcount(SharedPtr::null(), src_count.overflowing_add(1).0, guard);
                 if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
                     .compare_and_set(src_slot, empty_slot, Ordering::SeqCst, guard)
                     .is_ok()
@@ -551,8 +553,9 @@ where
                 return;
             }
             // overflow will be handled by `check_counter`.
-            let new_slot_without_mark = Self::set_rlcount(src_slot, src_count.overflowing_add(1).0, guard)
-                .with_lower_u2(SlotState::NullOrKey.as_u8());
+            let new_slot_without_mark =
+                Self::set_rlcount(src_slot, src_count.overflowing_add(1).0, guard)
+                    .with_lower_u2(SlotState::NullOrKey.as_u8());
             if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
                 .compare_and_set(src_slot, new_slot_without_mark, Ordering::SeqCst, guard)
                 .is_ok()
