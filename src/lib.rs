@@ -33,7 +33,9 @@
 #![allow(
     // Some explicitly allowed Clippy lints, must have clear reason to allow
     clippy::implicit_return, // actually omitting the return keyword is idiomatic Rust code
-    clippy::indexing_slicing,
+    // indexing will never panic here, because all of the index has been mod by the length
+    // of the vector.
+    clippy::indexing_slicing, 
 )]
 
 /// `pointer` defines atomic pointers which will be used for lockfree operations.
