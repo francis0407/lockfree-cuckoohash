@@ -155,6 +155,13 @@ impl<T> SharedPtr<'_, T> {
         raw
     }
 
+    /// `as_mut_raw` extracts the mutable raw pointer.
+    #[allow(clippy::as_conversions)]
+    pub const fn as_mut_raw(&self) -> *mut T {
+        let const_raw = self.as_raw();
+        const_raw as *mut T
+    }
+
     /// `with_lower_u2` resets the lower 2 bits of the pointer.
     #[allow(clippy::as_conversions)]
     pub const fn with_lower_u2(&self, lower_u8: u8) -> Self {
