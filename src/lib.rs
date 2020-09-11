@@ -354,7 +354,7 @@ where
                     RelocateResult::NeedResize => {
                         self.resize(outer_map, guard);
                         return false;
-                    },
+                    }
                     RelocateResult::Resized => {
                         return false;
                     }
@@ -641,7 +641,8 @@ where
                 if self.get_slot(src_idx, guard).as_raw() != src_slot.as_raw() {
                     continue;
                 }
-                let new_slot = Self::set_rlcount(src_slot, new_count, guard);
+                let new_slot = Self::set_rlcount(src_slot, new_count, guard)
+                    .with_lower_u2(SlotState::NullOrKey.into_u8());
 
                 if self.tables[dst_idx.tbl_idx][dst_idx.slot_idx]
                     .compare_and_set(dst_slot, new_slot, Ordering::SeqCst, guard)
@@ -1320,7 +1321,6 @@ mod tests {
 
             base_map.insert(key, value);
             cuckoo_map.insert_with_guard(key, value, &guard);
-            println!("{}", i);
         }
 
         assert_eq!(base_map.len(), cuckoo_map.size());
