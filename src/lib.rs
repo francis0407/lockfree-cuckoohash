@@ -328,7 +328,10 @@ where
 
                 // update the relocation count.
                 new_slot = Self::set_rlcount(new_slot, Self::get_rlcount(target_slot), guard);
-
+                let target_state = Self::slot_state(target_slot);
+                if target_state != SlotState::NullOrKey {
+                    print!("BUG2");
+                }
                 match self.tables[slot_idx.tbl_idx][slot_idx.slot_idx].compare_and_set(
                     target_slot,
                     new_slot,
@@ -619,20 +622,18 @@ where
                     return true;
                 }
                 let new_slot_with_reloc = src_slot.with_lower_u2(SlotState::Reloc.into_u8());
-                // The result will be checked by the `while condition`.
-                match self.tables[src_idx.tbl_idx][src_idx.slot_idx].compare_and_set(
-                    src_slot,
-                    new_slot_with_reloc,
-                    Ordering::SeqCst,
-                    guard,
-                ) {
-                    Ok(_) => break,
-                    // If the CAS failed, the initiator should try again.
-                    Err((current, _)) => src_slot = current,
+                // Only this CAS can set the `Relocation` state!
+                if self.tables[src_idx.tbl_idx][src_idx.slot_idx]
+                    .compare_and_set(src_slot, new_slot_with_reloc, Ordering::SeqCst, guard)
+                    .is_ok()
+                {
+                    // do nothing here, the slot state is checked by the while condition.
                 }
+                src_slot = self.get_slot(src_idx, guard);
             }
 
-            match Self::slot_state(src_slot) {
+            let (src_count, src_entry, src_state) = Self::unwrap_slot(src_slot);
+            match src_state {
                 SlotState::NullOrKey => {
                     return true;
                 }
@@ -644,8 +645,6 @@ where
                 }
                 SlotState::Reloc => {}
             }
-
-            let (src_count, src_entry, _) = Self::unwrap_slot(src_slot);
             let dst_idx = self.get_index(
                 1_usize.overflowing_sub(src_idx.tbl_idx).0,
                 &src_entry.expect("src slot is null").key,
@@ -653,9 +652,7 @@ where
             let dst_slot = self.get_slot(dst_idx, guard);
             let (dst_count, dst_entry, dst_state) = Self::unwrap_slot(dst_slot);
             if let SlotState::Copied = dst_state {
-                let new_slot_without_mark =
-                    Self::set_rlcount(src_slot, src_count.overflowing_add(1).0, guard)
-                        .with_lower_u2(SlotState::NullOrKey.into_u8());
+                let new_slot_without_mark = src_slot.with_lower_u2(SlotState::NullOrKey.into_u8());
                 self.tables[src_idx.tbl_idx][src_idx.slot_idx]
                     .compare_and_set(src_slot, new_slot_without_mark, Ordering::SeqCst, guard)
                     .ok();
@@ -688,8 +685,9 @@ where
                         .compare_and_set(src_slot, empty_slot, Ordering::SeqCst, guard)
                         .is_ok()
                     {
-                        return true;
+                        // do nothing
                     }
+                    return true;
                 }
             }
             // dst is not null
@@ -701,7 +699,7 @@ where
                     .compare_and_set(src_slot, empty_slot, Ordering::SeqCst, guard)
                     .is_ok()
                 {
-                    // failure cannot happen here.
+                    // do nothing
                 }
                 return true;
             }
@@ -749,13 +747,6 @@ where
         // unimplemented!("")
         let capacity = self.capacity();
         let capacity_per_table = self.tables[0].len();
-        let new_map = unsafe {
-            self.new_map
-                .load(Ordering::SeqCst, guard)
-                .as_raw()
-                .as_ref()
-                .unwrap()
-        };
         loop {
             let next_copy_idx = self.next_copy_idx.fetch_add(1, Ordering::SeqCst);
             if next_copy_idx >= capacity {
@@ -766,46 +757,7 @@ where
                 tbl_idx: next_copy_idx.overflowing_div(capacity_per_table).0,
                 slot_idx: next_copy_idx.overflowing_rem(capacity_per_table).0,
             };
-            loop {
-                let slot = self.get_slot(slot_idx, guard);
-                let (_, _, state) = Self::unwrap_slot(slot);
-                match state {
-                    SlotState::NullOrKey => {
-                        let new_slot = slot.with_lower_u2(SlotState::Copied.into_u8());
-                        match self.tables[slot_idx.tbl_idx][slot_idx.slot_idx].compare_and_set(
-                            slot,
-                            new_slot,
-                            Ordering::SeqCst,
-                            guard,
-                        ) {
-                            Ok(_) => {
-                                if !Self::slot_is_empty(new_slot) {
-                                    loop {
-                                        if !new_map.insert(
-                                            new_slot.with_lower_u2(SlotState::NullOrKey.into_u8()),
-                                            &self.new_map,
-                                            guard,
-                                        ) {
-                                            continue;
-                                        }
-                                        break;
-                                    }
-                                }
-                                self.copied_num.fetch_add(1, Ordering::SeqCst);
-                                break;
-                            }
-                            Err(_) => continue,
-                        }
-                    }
-                    SlotState::Reloc => {
-                        self.help_relocate(slot_idx, false, true, outer_map, guard);
-                        continue;
-                    }
-                    SlotState::Copied => {
-                        // shoule never be here
-                    }
-                }
-            }
+            self.copy_slot(slot_idx, outer_map, guard);
         }
 
         // waiting for finishing the copy of all the slots.
@@ -815,13 +767,77 @@ where
             if copied_num == capacity {
                 // try to promote the new map
                 let current_map = SharedPtr::from_raw(self);
+                let new_map = unsafe {
+                    self.new_map
+                        .load(Ordering::SeqCst, guard)
+                        .as_raw()
+                        .as_ref()
+                        .unwrap()
+                };
+                let new_map_size = new_map.size();
                 let new_map = self.new_map.load(Ordering::SeqCst, guard);
+                let current_map_size = self.size();
                 if let Ok(_current_map) =
                     outer_map.compare_and_set(current_map, new_map, Ordering::SeqCst, guard)
                 {
                     // TODO: free the current map
+                    if new_map_size != current_map_size {
+                        println!("BUG");
+                    }
                 }
                 break;
+            }
+        }
+    }
+
+    /// doc
+    fn copy_slot(&self, slot_idx: SlotIndex, outer_map: &AtomicPtr<Self>, guard: &'guard Guard) {
+        loop {
+            let slot = self.get_slot(slot_idx, guard);
+            let (_, _, state) = Self::unwrap_slot(slot);
+            match state {
+                SlotState::NullOrKey => {
+                    let new_slot = slot.with_lower_u2(SlotState::Copied.into_u8());
+                    match self.tables[slot_idx.tbl_idx][slot_idx.slot_idx].compare_and_set(
+                        slot,
+                        new_slot,
+                        Ordering::SeqCst,
+                        guard,
+                    ) {
+                        Ok(_) => {
+                            if !Self::slot_is_empty(new_slot) {
+                                loop {
+                                    let new_map = unsafe {
+                                        self.new_map
+                                            .load(Ordering::SeqCst, guard)
+                                            .as_raw()
+                                            .as_ref()
+                                            .unwrap()
+                                    };
+                                    if !new_map.insert(
+                                        SharedPtr::from_raw(slot.as_raw()),
+                                        &self.new_map,
+                                        guard,
+                                    ) {
+                                        continue;
+                                    }
+                                    break;
+                                }
+                            }
+                            self.copied_num.fetch_add(1, Ordering::SeqCst);
+                            break;
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                SlotState::Reloc => {
+                    self.help_relocate(slot_idx, false, false, outer_map, guard);
+                    continue;
+                }
+                SlotState::Copied => {
+                    // shoule never be here
+                    panic!("should never be here");
+                }
             }
         }
     }
@@ -979,6 +995,7 @@ where
             guard,
         ) {
             if need_free {
+                self.size.fetch_sub(1, Ordering::SeqCst);
                 Self::defer_drop_ifneed(old_slot, guard);
             }
         }
@@ -1453,9 +1470,9 @@ mod tests {
 
     #[test]
     fn test_multi_thread_resize() {
-        let insert_per_thread = 1000;
-        let num_thread = 4;
-        let cuckoo_map: LockFreeCuckooHash<u32, u32> = LockFreeCuckooHash::new();
+        let insert_per_thread = 100000;
+        let num_thread = 8;
+        let cuckoo_map: LockFreeCuckooHash<u32, u32> = LockFreeCuckooHash::with_capacity(8);
         let mut base_map: HashMap<u32, u32> = HashMap::new();
         let mut entries: Vec<(u32, u32)> = Vec::with_capacity(insert_per_thread * num_thread);
 
@@ -1492,8 +1509,10 @@ mod tests {
         }
 
         let guard = pin();
+        assert_eq!(base_map.len(), cuckoo_map.size());
         for (k, v) in base_map {
             let v2 = cuckoo_map.search_with_guard(&k, &guard);
+            assert!(v2.is_some());
             assert_eq!(v, *v2.unwrap());
         }
     }
