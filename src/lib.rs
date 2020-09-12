@@ -79,7 +79,7 @@ struct SlotIndex {
 /// A slot could be in one of the four states: null, key, reloc and copied.
 #[derive(PartialEq)]
 enum SlotState {
-    /// `NullOrKey` means a slot is empty(null) or is ocupied by a key-value
+    /// `NullOrKey` means a slot is empty(null) or is occupied by a key-value
     /// pair normally without any other flags.
     NullOrKey,
     /// `Reloc` means a slot is being relocated to the other slot.
@@ -434,7 +434,6 @@ where
     ///     a> the table index of the slot that has the same key.
     ///     b> the first slot.
     ///     c> the second slot.
-    #[allow(clippy::too_many_lines)]
     fn find(
         &self,
         key: &K,
@@ -444,131 +443,152 @@ where
         guard: &'guard Guard,
     ) -> Option<FindResult<'guard, K, V>> {
         loop {
-            let mut result_tbl_index = None;
+            // Similar to `search`, `find` also uses a two-round search protocol.
+            // If either of the two rounds finds a slot that contains the key, this method
+            // returns the table index of that slot.
+            // If both of the two rounds cannot find the key, we will check the relocation
+            // count to decide whether we need to retry the two-round search.
 
-            // The first round:
-            // Check the first table.
-            let slot0 = self.get_slot(slot_idx0, guard);
-            let (count0_0, entry0, state0_0) = Self::unwrap_slot(slot0);
-            match state0_0 {
-                SlotState::Reloc => {
-                    self.help_relocate(slot_idx0, false, outer_map, guard);
-                    continue;
-                }
-                SlotState::Copied => {
-                    self.help_resize(outer_map, guard);
-                    return None;
-                }
-                SlotState::NullOrKey => {
-                    if let Some(pair) = entry0 {
-                        if pair.key.eq(key) {
-                            result_tbl_index = Some(0);
-                            // We cannot return here, because we may have duplicated keys in both slots.
-                            // We must do the deduplication in this method.
-                        }
-                    }
-                }
-            }
-            // Check the second table.
-            let slot1 = self.get_slot(slot_idx1, guard);
-            let (count0_1, entry1, state0_1) = Self::unwrap_slot(slot1);
-            match state0_1 {
-                SlotState::Reloc => {
-                    self.help_relocate(slot_idx1, false, outer_map, guard);
-                    continue;
-                }
-                SlotState::Copied => {
-                    self.help_resize(outer_map, guard);
-                    return None;
-                }
-                SlotState::NullOrKey => {
-                    if let Some(pair) = entry1 {
-                        if pair.key.eq(key) {
-                            if result_tbl_index.is_some() {
-                                // We have a duplicated key in both slots,
-                                // need to delete the second one.
-                                self.del_dup(slot_idx0, slot0, slot_idx1, slot1, guard);
-                            } else {
-                                result_tbl_index = Some(1);
-                            }
-                        }
-                    }
-                }
+            // If `try_find` meets a copied slot (during resize), it will help the resize and
+            // then returns the `resize0` as true.
+            // If `try_find` meets a slot which is being relocated, it will help the relocation
+            // and then returns the `reloc0` as true. Notice that, if the relocation fails because
+            // `help_relocate` meets a copied slot, `try_find` will return `resize0` as true.
+            let (fr0, reloc0, resize0) = self.try_find(key, slot_idx0, slot_idx1, outer_map, guard);
+
+            // `try_find` helps finish a resize, so return `None` to let the caller retry
+            // the opertion with the new resized map.
+            if resize0 {
+                return None;
             }
 
-            if result_tbl_index.is_some() {
-                return Some(FindResult {
-                    tbl_idx: result_tbl_index,
-                    slot0,
-                    slot1,
-                });
+            // `try_find` successfully helps a relocation, so we continue the loop to retry the
+            // two-round search.
+            if reloc0 {
+                continue;
             }
 
-            // The second round:
-            let slot0 = self.get_slot(slot_idx0, guard);
-            let (count1_0, entry0, state1_0) = Self::unwrap_slot(slot0);
-            match state1_0 {
-                SlotState::Reloc => {
-                    self.help_relocate(slot_idx0, false, outer_map, guard);
-                    continue;
-                }
-                SlotState::Copied => {
-                    self.help_resize(outer_map, guard);
-                    return None;
-                }
-                SlotState::NullOrKey => {
-                    if let Some(pair) = entry0 {
-                        if pair.key.eq(key) {
-                            result_tbl_index = Some(0);
-                            // We cannot return here, because we may have duplicated keys in both slots.
-                            // We must do the deduplication in this method.
-                        }
-                    }
-                }
+            // The first round successfully finds a slot that contains the key, so we don't need
+            // the second round now, just return the result here.
+            if fr0.tbl_idx.is_some() {
+                return Some(fr0);
             }
 
-            let slot1 = self.get_slot(slot_idx1, guard);
-            let (count1_1, entry1, state1_1) = Self::unwrap_slot(slot1);
-            match state1_1 {
-                SlotState::Reloc => {
-                    self.help_relocate(slot_idx1, false, outer_map, guard);
-                    continue;
-                }
-                SlotState::Copied => {
-                    self.help_resize(outer_map, guard);
-                    return None;
-                }
-                SlotState::NullOrKey => {
-                    if let Some(pair) = entry1 {
-                        if pair.key.eq(key) {
-                            if result_tbl_index.is_some() {
-                                // We have a duplicated key in both slots,
-                                // need to delete the second one.
-                                self.del_dup(slot_idx0, slot0, slot_idx1, slot1, guard);
-                            } else {
-                                result_tbl_index = Some(1);
-                            }
-                        }
-                    }
-                }
+            // Otherwise, we need try the second round.
+            let (fr1, reloc1, resize1) = self.try_find(key, slot_idx0, slot_idx1, outer_map, guard);
+            if resize1 {
+                return None;
+            }
+            if reloc1 {
+                continue;
+            }
+            if fr1.tbl_idx.is_some() {
+                return Some(fr1);
             }
 
-            if result_tbl_index.is_some() {
-                return Some(FindResult {
-                    tbl_idx: result_tbl_index,
-                    slot0,
-                    slot1,
-                });
-            }
-
-            if !Self::check_counter(count0_0, count0_1, count1_0, count1_1) {
+            // Neither of the tow rounds can find the key, we check the relocation count to determine
+            // whether we need to retry.
+            if !Self::check_counter(
+                Self::get_rlcount(fr0.slot0),
+                Self::get_rlcount(fr0.slot1),
+                Self::get_rlcount(fr1.slot0),
+                Self::get_rlcount(fr1.slot1),
+            ) {
                 return Some(FindResult {
                     tbl_idx: None,
-                    slot0,
-                    slot1,
+                    slot0: fr1.slot0,
+                    slot1: fr1.slot1,
                 });
             }
         }
+    }
+
+    /// `try_find` tries to find the key in the hash map (only once).
+    /// The returned values are:
+    /// 1. The find result, including the index of the slot which contains the key, and both slots of the key.
+    /// 2. Whether we successfully help a relocation.
+    /// 3. Whether the map has been resized.
+    fn try_find(
+        &self,
+        key: &K,
+        slot_idx0: SlotIndex,
+        slot_idx1: SlotIndex,
+        outer_map: &AtomicPtr<Self>,
+        guard: &'guard Guard,
+    ) -> (FindResult<'guard, K, V>, bool, bool) {
+        let mut result = FindResult {
+            tbl_idx: None,
+            slot0: SharedPtr::null(),
+            slot1: SharedPtr::null(),
+        };
+        // Read the first slot at first.
+        let slot0 = self.get_slot(slot_idx0, guard);
+        let (_, entry0, state0) = Self::unwrap_slot(slot0);
+        match state0 {
+            SlotState::Reloc => {
+                // The slot is being relocated, we help this relocation.
+                if self.help_relocate(slot_idx0, false, true, outer_map, guard) {
+                    // The relocation succeeds, we set the second returned value as `true`.
+                    return (result, true, false);
+                } else {
+                    // The relocation fails, because the table has been resized.
+                    // We set the third returned value as `true`.
+                    return (result, false, true);
+                }
+            }
+            SlotState::Copied => {
+                // The slot is being copied or has copied to the new map, so we try
+                // to help the resize, and set the third returned value as `true`.
+                self.help_resize(outer_map, guard);
+                return (result, false, true);
+            }
+            SlotState::NullOrKey => {
+                // There is not special flag on the slot, so we compare the keys.
+                if let Some(pair) = entry0 {
+                    if pair.key.eq(key) {
+                        result.tbl_idx = Some(0);
+                        // We successfully match the searched key, but we cannot return here,
+                        // because we may have duplicated keys in both slots.
+                        // We must do the deduplication in this method.
+                    }
+                }
+            }
+        }
+        // Check the second table.
+        let slot1 = self.get_slot(slot_idx1, guard);
+        let (_, entry1, state1) = Self::unwrap_slot(slot1);
+        match state1 {
+            SlotState::Reloc => {
+                if self.help_relocate(slot_idx1, false, true, outer_map, guard) {
+                    return (result, true, false);
+                } else {
+                    return (result, false, true);
+                }
+            }
+            SlotState::Copied => {
+                self.help_resize(outer_map, guard);
+                return (result, false, true);
+            }
+            SlotState::NullOrKey => {
+                if let Some(pair) = entry1 {
+                    if pair.key.eq(key) {
+                        if result.tbl_idx.is_some() {
+                            // We have a duplicated key in both slots,
+                            // try to delete the second one.
+                            self.del_dup(slot_idx0, slot0, slot_idx1, slot1, guard);
+                        } else {
+                            // Otherwise, we successfully find the key in the
+                            // second slot, we can return the table index as 1 then.
+                            result.tbl_idx = Some(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        result.slot0 = slot0;
+        result.slot1 = slot1;
+        (result, false, false)
     }
 
     /// `help_relocate` helps relocate the slot at `src_idx` to the other corresponding slot.
@@ -582,6 +602,7 @@ where
         &self,
         src_idx: SlotIndex,
         initiator: bool,
+        need_help_resize: bool,
         outer_map: &AtomicPtr<Self>,
         guard: &'guard Guard,
     ) -> bool {
@@ -589,7 +610,9 @@ where
             let mut src_slot = self.get_slot(src_idx, guard);
             while initiator && Self::slot_state(src_slot) != SlotState::Reloc {
                 if Self::slot_state(src_slot) == SlotState::Copied {
-                    self.help_resize(outer_map, guard);
+                    if need_help_resize {
+                        self.help_resize(outer_map, guard);
+                    }
                     return false;
                 }
                 if Self::slot_is_empty(src_slot) {
@@ -614,7 +637,9 @@ where
                     return true;
                 }
                 SlotState::Copied => {
-                    self.help_resize(outer_map, guard);
+                    if need_help_resize {
+                        self.help_resize(outer_map, guard);
+                    }
                     return false;
                 }
                 SlotState::Reloc => {}
@@ -628,7 +653,15 @@ where
             let dst_slot = self.get_slot(dst_idx, guard);
             let (dst_count, dst_entry, dst_state) = Self::unwrap_slot(dst_slot);
             if let SlotState::Copied = dst_state {
-                self.help_resize(outer_map, guard);
+                let new_slot_without_mark =
+                    Self::set_rlcount(src_slot, src_count.overflowing_add(1).0, guard)
+                        .with_lower_u2(SlotState::NullOrKey.into_u8());
+                self.tables[src_idx.tbl_idx][src_idx.slot_idx]
+                    .compare_and_set(src_slot, new_slot_without_mark, Ordering::SeqCst, guard)
+                    .ok();
+                if need_help_resize {
+                    self.help_resize(outer_map, guard);
+                }
                 return false;
             }
             if dst_entry.is_none() {
@@ -765,7 +798,7 @@ where
                         }
                     }
                     SlotState::Reloc => {
-                        self.help_relocate(slot_idx, false, outer_map, guard);
+                        self.help_relocate(slot_idx, false, true, outer_map, guard);
                         continue;
                     }
                     SlotState::Copied => {
@@ -822,7 +855,9 @@ where
             loop {
                 let mut slot = self.get_slot(slot_idx, guard);
                 while Self::slot_state(slot) == SlotState::Reloc {
-                    self.help_relocate(slot_idx, false, outer_map, guard);
+                    if !self.help_relocate(slot_idx, false, true, outer_map, guard) {
+                        return RelocateResult::Resized;
+                    }
                     slot = self.get_slot(slot_idx, guard);
                 }
                 let (_, entry, state) = Self::unwrap_slot(slot);
@@ -874,7 +909,9 @@ where
                     let src_idx = route[i];
                     let mut src_slot = self.get_slot(src_idx, guard);
                     while Self::slot_state(src_slot) == SlotState::Reloc {
-                        self.help_relocate(src_idx, false, outer_map, guard);
+                        if !self.help_relocate(src_idx, false, true, outer_map, guard) {
+                            return RelocateResult::Resized;
+                        }
                         src_slot = self.get_slot(src_idx, guard);
                     }
                     let (_, entry, state) = Self::unwrap_slot(src_slot);
@@ -896,7 +933,9 @@ where
                             slot_idx = dst_idx;
                             continue 'main_loop;
                         }
-                        self.help_relocate(src_idx, true, outer_map, guard);
+                        if !self.help_relocate(src_idx, true, true, outer_map, guard) {
+                            return RelocateResult::Resized;
+                        }
                     }
                     continue 'slot_swap;
                 }
@@ -1312,7 +1351,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let guard = pin();
 
-        for i in 0..size {
+        for _ in 0..size {
             let mut key: u32 = rng.gen();
             while base_map.contains_key(&key) {
                 key = rng.gen();
@@ -1406,6 +1445,53 @@ mod tests {
             handle.join().unwrap();
         }
 
+        for (k, v) in base_map {
+            let v2 = cuckoo_map.search_with_guard(&k, &guard);
+            assert_eq!(v, *v2.unwrap());
+        }
+    }
+
+    #[test]
+    fn test_multi_thread_resize() {
+        let insert_per_thread = 1000;
+        let num_thread = 4;
+        let cuckoo_map: LockFreeCuckooHash<u32, u32> = LockFreeCuckooHash::new();
+        let mut base_map: HashMap<u32, u32> = HashMap::new();
+        let mut entries: Vec<(u32, u32)> = Vec::with_capacity(insert_per_thread * num_thread);
+
+        let mut rng = rand::thread_rng();
+
+        for _ in 0..(insert_per_thread * num_thread) {
+            let mut key: u32 = rng.gen();
+            while base_map.contains_key(&key) {
+                key = rng.gen();
+            }
+            let value: u32 = rng.gen();
+            base_map.insert(key, value);
+            entries.push((key, value));
+        }
+
+        let mut handles = Vec::with_capacity(num_thread);
+        let cuckoo_map = Arc::new(cuckoo_map);
+        let entries = Arc::new(entries);
+        for thread_idx in 0..num_thread {
+            let cuckoo_map = cuckoo_map.clone();
+            let entries = entries.clone();
+            let handle = std::thread::spawn(move || {
+                let guard = pin();
+                let begin = thread_idx * insert_per_thread;
+                for i in begin..(begin + insert_per_thread) {
+                    cuckoo_map.insert_with_guard(entries[i].0, entries[i].1, &guard);
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let guard = pin();
         for (k, v) in base_map {
             let v2 = cuckoo_map.search_with_guard(&k, &guard);
             assert_eq!(v, *v2.unwrap());
