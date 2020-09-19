@@ -53,7 +53,7 @@ impl<T> AtomicPtr<T> {
         // TODO: allow different ordering.
         self.data
             .compare_exchange(current_ptr.as_usize(), new, ord, ord)
-            .map(|_| SharedPtr::from_usize(new))
+            .map(|_| SharedPtr::from_usize(current_ptr.as_usize()))
             .map_err(|current| (SharedPtr::from_usize(current), SharedPtr::from_usize(new)))
     }
 }
@@ -106,6 +106,11 @@ impl<T> SharedPtr<'_, T> {
     /// `null` returns a null `SharedPtr`.
     pub const fn null() -> Self {
         Self::from_usize(0)
+    }
+
+    /// `into_box` converts the pointer into a Box<T>.
+    pub unsafe fn into_box(self) -> Box<T> {
+        Box::from_raw(self.as_mut_raw())
     }
 
     /// `as_usize` converts the pointer to `usize`.

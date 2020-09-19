@@ -328,10 +328,7 @@ where
 
                 // update the relocation count.
                 new_slot = Self::set_rlcount(new_slot, Self::get_rlcount(target_slot), guard);
-                let target_state = Self::slot_state(target_slot);
-                if target_state != SlotState::NullOrKey {
-                    print!("BUG2");
-                }
+
                 match self.tables[slot_idx.tbl_idx][slot_idx.slot_idx].compare_and_set(
                     target_slot,
                     new_slot,
@@ -342,7 +339,9 @@ where
                         if !is_replcace {
                             self.size.fetch_add(1, Ordering::SeqCst);
                         }
-                        Self::defer_drop_ifneed(old_slot, guard);
+                        if old_slot.as_raw() != new_slot.as_raw() {
+                            Self::defer_drop_ifneed(old_slot, guard);
+                        }
                         return true;
                     }
                     Err(err) => {
@@ -578,7 +577,7 @@ where
                         if result.tbl_idx.is_some() {
                             // We have a duplicated key in both slots,
                             // try to delete the second one.
-                            self.del_dup(slot_idx0, slot0, slot_idx1, slot1, guard);
+                            self.del_dup(slot_idx0, slot_idx1, outer_map, guard);
                         } else {
                             // Otherwise, we successfully find the key in the
                             // second slot, we can return the table index as 1 then.
@@ -711,7 +710,7 @@ where
                 .compare_and_set(src_slot, new_slot_without_mark, Ordering::SeqCst, guard)
                 .is_ok()
             {
-                // failure cannot happen here.
+                // do nothing
             }
             return true;
         }
@@ -720,29 +719,38 @@ where
     /// `resize` resizes the table.
     #[allow(clippy::expect_used)]
     fn resize(&self, outer_map: &AtomicPtr<Self>, guard: &'guard Guard) {
-        let new_capacity = self
-            .capacity()
-            .checked_mul(2)
-            .expect("Capacity overflowed.");
-        // Allocate the new map.
-        let new_map = SharedPtr::from_box(Box::new(Self::with_capacity(
-            new_capacity,
-            [self.hash_builders[0].clone(), self.hash_builders[1].clone()],
-        )));
-        // Initialize `self.new_map`.
-        if let Err((_, _new_map)) =
-            self.new_map
-                .compare_and_set(SharedPtr::null(), new_map, Ordering::SeqCst, guard)
+        if self
+            .new_map
+            .load(Ordering::SeqCst, guard)
+            .as_raw()
+            .is_null()
         {
-            // Free the box
-            // TODO: we can avoid this redundent allocation.
-            // TODO: drop the new_map
+            let new_capacity = self
+                .capacity()
+                .checked_mul(2)
+                .expect("Capacity overflowed.");
+            // Allocate the new map.
+            let new_map = SharedPtr::from_box(Box::new(Self::with_capacity(
+                new_capacity,
+                [self.hash_builders[0].clone(), self.hash_builders[1].clone()],
+            )));
+            // Initialize `self.new_map`.
+            if self
+                .new_map
+                .compare_and_set(SharedPtr::null(), new_map, Ordering::SeqCst, guard)
+                .is_err()
+            {
+                // Free the box
+                // TODO: we can avoid this redundent allocation.
+                unsafe {
+                    new_map.into_box();
+                }
+            }
         }
         self.help_resize(outer_map, guard);
     }
 
     /// `help_resize` helps copy the current `MapInner` into `self.new_map`.
-    #[allow(clippy::unwrap_used)]
     fn help_resize(&self, outer_map: &AtomicPtr<Self>, guard: &'guard Guard) {
         // unimplemented!("")
         let capacity = self.capacity();
@@ -767,22 +775,15 @@ where
             if copied_num == capacity {
                 // try to promote the new map
                 let current_map = SharedPtr::from_raw(self);
-                let new_map = unsafe {
-                    self.new_map
-                        .load(Ordering::SeqCst, guard)
-                        .as_raw()
-                        .as_ref()
-                        .unwrap()
-                };
-                let new_map_size = new_map.size();
                 let new_map = self.new_map.load(Ordering::SeqCst, guard);
-                let current_map_size = self.size();
-                if let Ok(_current_map) =
+                if let Ok(current_map) =
                     outer_map.compare_and_set(current_map, new_map, Ordering::SeqCst, guard)
                 {
                     // TODO: free the current map
-                    if new_map_size != current_map_size {
-                        println!("BUG");
+                    unsafe {
+                        guard.defer_destroy(
+                            Owned::from_raw(current_map.as_mut_raw()).into_shared(guard),
+                        );
                     }
                 }
                 break;
@@ -790,7 +791,8 @@ where
         }
     }
 
-    /// doc
+    /// `copy_slot` copies a single slot into the new map.
+    #[allow(clippy::unwrap_used)]
     fn copy_slot(&self, slot_idx: SlotIndex, outer_map: &AtomicPtr<Self>, guard: &'guard Guard) {
         loop {
             let slot = self.get_slot(slot_idx, guard);
@@ -836,7 +838,6 @@ where
                 }
                 SlotState::Copied => {
                     // shoule never be here
-                    panic!("should never be here");
                 }
             }
         }
@@ -896,9 +897,9 @@ where
                     if let Some(pair) = next_entry {
                         if pair.key.eq(key) {
                             if slot_idx.tbl_idx == 0 {
-                                self.del_dup(slot_idx, slot, next_slot_idx, next_slot, guard);
+                                self.del_dup(slot_idx, next_slot_idx, outer_map, guard);
                             } else {
-                                self.del_dup(next_slot_idx, next_slot, slot_idx, slot, guard);
+                                self.del_dup(next_slot_idx, slot_idx, outer_map, guard);
                             }
                         }
                     }
@@ -965,16 +966,37 @@ where
     fn del_dup(
         &self,
         slot_idx0: SlotIndex,
-        slot0: SharedPtr<'guard, KVPair<K, V>>,
         slot_idx1: SlotIndex,
-        slot1: SharedPtr<'guard, KVPair<K, V>>,
+        outer_map: &AtomicPtr<Self>,
         guard: &'guard Guard,
     ) {
-        if self.get_slot(slot_idx0, guard).as_raw() != slot0.as_raw()
-            && self.get_slot(slot_idx1, guard).as_raw() != slot1.as_raw()
-        {
+        let slot0 = self.get_slot(slot_idx0, guard);
+        let slot1 = self.get_slot(slot_idx1, guard);
+
+        if Self::slot_state(slot0) == SlotState::Reloc {
+            self.help_relocate(slot_idx0, false, false, outer_map, guard);
             return;
         }
+        if Self::slot_state(slot0) == SlotState::Copied {
+            return;
+        }
+        if Self::slot_state(slot1) == SlotState::Reloc {
+            self.help_relocate(slot_idx1, false, false, outer_map, guard);
+            return;
+        }
+        if Self::slot_state(slot1) == SlotState::Copied {
+            return;
+        }
+
+        if slot1.as_raw() == slot0.as_raw() {
+            // FIXME:
+            //   This is a tricky fix for the duplicated key problem which
+            //   cannot deduplicate the co-existed key (with the same pointer).
+            //   This kind of duplicated key is generated by `help_relocate`.
+            //   We hope another `help_relocate` or `resize` can solve it.
+            return;
+        }
+
         let (_, entry0, _) = Self::unwrap_slot(slot0);
         let (slot1_count, entry1, _) = Self::unwrap_slot(slot1);
         let mut need_dedup = false;
@@ -1118,7 +1140,10 @@ where
 /// slot of it is also occupied, another `relocation` is required and so on. If relocation is a very long chain
 /// or meets a infinite loop, the table should be resized or rehashed.
 ///
-pub struct LockFreeCuckooHash<K, V> {
+pub struct LockFreeCuckooHash<K, V>
+where
+    K: Eq + Hash,
+{
     /// The inner map will be replaced after resize.
     map: AtomicPtr<MapInner<K, V>>,
 }
@@ -1142,6 +1167,43 @@ where
     #[inline]
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<K, V> Drop for LockFreeCuckooHash<K, V>
+where
+    K: Eq + Hash,
+{
+    #[inline]
+    fn drop(&mut self) {
+        let guard = pin();
+        let inner = self.load_inner(&guard);
+        for i in 0..2 {
+            for j in 0..inner.tables[0].len() {
+                // key might be duplicated, so we only free the one in primary table.
+                let slot = inner.get_slot(
+                    SlotIndex {
+                        tbl_idx: i,
+                        slot_idx: j,
+                    },
+                    &guard,
+                );
+                if i == 1 {
+                    let (_, entry, _) = MapInner::unwrap_slot(slot);
+                    if let Some(pair) = entry {
+                        let primary_slot_idx = inner.get_index(0, &pair.key);
+                        let primary_slot = inner.get_slot(primary_slot_idx, &guard);
+                        if primary_slot.as_raw() == slot.as_raw() {
+                            continue;
+                        }
+                    }
+                }
+                MapInner::defer_drop_ifneed(slot, &guard);
+            }
+        }
+        unsafe {
+            self.map.load(Ordering::SeqCst, &guard).into_box();
+        }
     }
 }
 
@@ -1388,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_threads() {
+    fn test_multi_thread() {
         let capacity: usize = 1_000_000;
         let load_factor: f32 = 0.2;
         let num_thread: usize = 4;
